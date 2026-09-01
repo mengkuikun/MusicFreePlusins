@@ -1,0 +1,11 @@
+{
+  "plugins": [
+    {
+      "name": "智能多源聚合",
+      "url": "https://raw.githubusercontent.com/mengkuikun/MusicFreePlusins/main/musicfree-auto-fallback-pure.js",
+      "version": "1.4.5-pure",
+      "author": "夢酷 (mengkuikun)",
+      "description": "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)"
+    }
+  ]
+}

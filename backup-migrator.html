@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MusicFree 歌单备份智能换源升级工具 v1.4.1</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: rgba(30, 41, 59, 0.9);
+      --primary: #38bdf8;
+      --primary-hover: #0ea5e9;
+      --accent: #818cf8;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --border: rgba(255, 255, 255, 0.12);
+      --success: #34d399;
+      --warning: #fbbf24;
+      --surface: rgba(15, 23, 42, 0.6);
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: radial-gradient(circle at top right, #1e1b4b, #0f172a 60%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .container {
+      background: var(--card-bg);
+      backdrop-filter: blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 36px;
+      max-width: 680px;
+      width: 100%;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6), 0 0 40px rgba(56, 189, 248, 0.08);
+      transition: all 0.3s ease;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #38bdf8, #818cf8, #c084fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .badge-ver {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 20px;
+      background: rgba(56, 189, 248, 0.15);
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      font-weight: 600;
+    }
+    p.desc {
+      color: var(--text-muted);
+      font-size: 13.5px;
+      line-height: 1.6;
+      margin-bottom: 20px;
+    }
+    .dropzone {
+      border: 2px dashed rgba(56, 189, 248, 0.4);
+      border-radius: 16px;
+      padding: 36px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      background: rgba(15, 23, 42, 0.4);
+    }
+    .dropzone:hover, .dropzone.dragover {
+      border-color: var(--primary);
+      background: rgba(56, 189, 248, 0.1);
+      transform: translateY(-2px);
+      box-shadow: 0 10px 25px -5px rgba(56, 189, 248, 0.2);
+    }
+    .icon {
+      font-size: 42px;
+      margin-bottom: 12px;
+      filter: drop-shadow(0 4px 10px rgba(56, 189, 248, 0.3));
+    }
+    .file-input {
+      display: none;
+    }
+
+    /* 歌单精细化选择区域 */
+    .sheet-selection-panel {
+      display: none;
+      margin-top: 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+      animation: fadeIn 0.3s ease;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .panel-title {
+      font-size: 15px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .quick-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .btn-sm {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-sm:hover {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: var(--primary);
+      color: #38bdf8;
+    }
+
+    .sheet-list {
+      max-height: 230px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-right: 4px;
+    }
+    .sheet-list::-webkit-scrollbar {
+      width: 6px;
+    }
+    .sheet-list::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 3px;
+    }
+
+    .sheet-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: all 0.2s;
+      user-select: none;
+    }
+    .sheet-item:hover {
+      background: rgba(56, 189, 248, 0.06);
+      border-color: rgba(56, 189, 248, 0.2);
+    }
+    .sheet-item.selected {
+      background: rgba(56, 189, 248, 0.12);
+      border-color: rgba(56, 189, 248, 0.4);
+    }
+    .sheet-item-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1;
+      overflow: hidden;
+    }
+    .sheet-checkbox {
+      width: 17px;
+      height: 17px;
+      accent-color: #0284c7;
+      cursor: pointer;
+    }
+    .sheet-name {
+      font-size: 14px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .sheet-badge {
+      font-size: 11.5px;
+      color: var(--text-muted);
+      background: rgba(0, 0, 0, 0.25);
+      padding: 2px 8px;
+      border-radius: 6px;
+      white-space: nowrap;
+    }
+    .sheet-status-badge {
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-left: 6px;
+    }
+    .badge-convert {
+      background: rgba(56, 189, 248, 0.2);
+      color: #38bdf8;
+    }
+    .badge-keep {
+      background: rgba(148, 163, 184, 0.15);
+      color: #94a3b8;
+    }
+
+    /* 统计看板 */
+    .stats {
+      margin-top: 16px;
+      padding: 16px;
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid var(--border);
+      font-size: 13.5px;
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .stats-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .stats-card-title {
+      color: var(--text-muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .stats-card-value {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .stats-card-value.highlight {
+      color: var(--primary);
+    }
+    .stats-card-value.success {
+      color: var(--success);
+    }
+    .stats-card-value.muted {
+      color: var(--text-muted);
+    }
+
+    .btn {
+      display: inline-block;
+      width: 100%;
+      margin-top: 14px;
+      padding: 14px 20px;
+      background: linear-gradient(135deg, #0284c7, #6366f1);
+      color: white;
+      font-size: 15px;
+      font-weight: 600;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-align: center;
+      text-decoration: none;
+      box-shadow: 0 4px 15px rgba(2, 132, 199, 0.3);
+    }
+    .btn:hover {
+      opacity: 0.95;
+      transform: translateY(-1px);
+      box-shadow: 0 8px 25px rgba(99, 102, 241, 0.4);
+    }
+    .btn:active {
+      transform: translateY(0);
+    }
+    .re-upload-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 12px;
+      padding: 6px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: block;
+      margin: 12px auto 0;
+      transition: all 0.2s;
+    }
+    .re-upload-btn:hover {
+      color: var(--text);
+      border-color: rgba(255, 255, 255, 0.3);
+    }
+
+    .instructions {
+      margin-top: 24px;
+      border-top: 1px solid var(--border);
+      padding-top: 18px;
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.7;
+    }
+    .instructions ol {
+      padding-left: 18px;
+      margin-top: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>MusicFree 歌单备份智能换源工具</h1>
+      <span class="badge-ver">v1.4.1 Pro</span>
+    </div>
+    <p class="desc">支持<strong>「指定歌单单独换源」</strong>或<strong>「全量一键升级」</strong>！将已导出的 MusicFree 备份中指定歌单平滑升级为智能多源聚合，未选中的歌单保持原音源 100% 不变。</p>
+
+    <!-- 拖拽上传区 -->
+    <div class="dropzone" id="dropzone">
+      <div class="icon">📂</div>
+      <div style="font-weight: 600; margin-bottom: 4px; font-size: 15px;">点击选择 或 拖拽备份文件到此处</div>
+      <div style="color: var(--text-muted); font-size: 13px;">支持 .json 格式的 MusicFree 导出备份文件</div>
+      <input type="file" id="fileInput" class="file-input" accept=".json" />
+    </div>
+
+    <!-- 歌单精细化选择与配置面板 -->
+    <div class="sheet-selection-panel" id="sheetSelectionPanel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span>📑 勾选需换源的歌单</span>
+          <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">(未勾选的歌单将保持原音源不变)</span>
+        </div>
+        <div class="quick-actions">
+          <button class="btn-sm" id="btnSelectAll">全选</button>
+          <button class="btn-sm" id="btnSelectNone">全不选</button>
+          <button class="btn-sm" id="btnSelectFav">仅我喜欢</button>
+        </div>
+      </div>
+
+      <!-- 歌单列表 -->
+      <div class="sheet-list" id="sheetList"></div>
+
+      <!-- 实时状态看板 -->
+      <div class="stats">
+        <div class="stats-grid">
+          <div class="stats-card">
+            <div class="stats-card-title">待换源歌单 / 总歌单</div>
+            <div class="stats-card-value highlight"><span id="selectedSheetCount">0</span> / <span id="totalSheetCount">0</span> 个</div>
+          </div>
+          <div class="stats-card">
+            <div class="stats-card-title">本次升级换源歌曲</div>
+            <div class="stats-card-value success" id="convertedSongCount">0 首</div>
+          </div>
+          <div class="stats-card">
+            <div class="stats-card-title">保持原音源不变歌曲</div>
+            <div class="stats-card-value muted" id="untouchedSongCount">0 首</div>
+          </div>
+          <div class="stats-card">
+            <div class="stats-card-title">原已是聚合源歌曲</div>
+            <div class="stats-card-value" id="alreadyAggregatedCount">0 首</div>
+          </div>
+        </div>
+        <button class="btn" id="downloadBtn">📥 下载升级后的备份文件 (.json)</button>
+        <button class="re-upload-btn" id="reUploadBtn">↻ 重新选择其他备份文件</button>
+      </div>
+    </div>
+
+    <!-- 操作说明 -->
+    <div class="instructions">
+      <strong>💡 三步无缝换源体验：</strong>
+      <ol>
+        <li>在 MusicFree 客户端：<strong>设置 -> 备份与恢复 -> 导出备份</strong>（导出 .json 文件）。</li>
+        <li>拖入上方工具，自由勾选你想单独换源的歌单，点击下载升级后的文件。</li>
+        <li>在 MusicFree 客户端：<strong>设置 -> 备份与恢复 -> 导入恢复</strong>，即可畅听全网！</li>
+      </ol>
+    </div>
+  </div>
+
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const sheetSelectionPanel = document.getElementById('sheetSelectionPanel');
+    const sheetListEl = document.getElementById('sheetList');
+    const btnSelectAll = document.getElementById('btnSelectAll');
+    const btnSelectNone = document.getElementById('btnSelectNone');
+    const btnSelectFav = document.getElementById('btnSelectFav');
+    const selectedSheetCountEl = document.getElementById('selectedSheetCount');
+    const totalSheetCountEl = document.getElementById('totalSheetCount');
+    const convertedSongCountEl = document.getElementById('convertedSongCount');
+    const untouchedSongCountEl = document.getElementById('untouchedSongCount');
+    const alreadyAggregatedCountEl = document.getElementById('alreadyAggregatedCount');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const reUploadBtn = document.getElementById('reUploadBtn');
+
+    let parsedBackupData = null;
+    let originalFileName = "musicfree_backup.json";
+    let detectedSheets = []; // [{ id, title, isFavorite, songsCount, alreadyCount, ref }]
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      if (e.dataTransfer.files.length > 0) processFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files.length > 0) processFile(e.target.files[0]);
+    });
+    reUploadBtn.addEventListener('click', () => {
+      fileInput.value = '';
+      dropzone.style.display = 'block';
+      sheetSelectionPanel.style.display = 'none';
+      parsedBackupData = null;
+      detectedSheets = [];
+    });
+
+    function formatDuration(duration) {
+      if (duration === undefined || duration === null || duration === "" || duration === 0) return "";
+      if (typeof duration === "string" && duration.includes(":")) return duration;
+      let sec = Number(duration);
+      if (isNaN(sec) || sec <= 0) return "";
+      if (sec > 10000) sec = Math.floor(sec / 1000);
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      const mStr = String(m).padStart(2, "0");
+      const sStr = String(s).padStart(2, "0");
+      if (h > 0) return `${String(h).padStart(2, "0")}:${mStr}:${sStr}`;
+      return `${mStr}:${sStr}`;
+    }
+
+    function processFile(file) {
+      originalFileName = file.name;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          parsedBackupData = JSON.parse(e.target.result);
+          detectedSheets = extractSheets(parsedBackupData);
+
+          if (detectedSheets.length === 0) {
+            alert("未在备份文件中检测到任何歌单数据，请确保是合法的 MusicFree 备份！");
+            return;
+          }
+
+          // 默认全选所有歌单
+          detectedSheets.forEach((s) => s.selected = true);
+
+          renderSheetList();
+          updateStatistics();
+
+          dropzone.style.display = 'none';
+          sheetSelectionPanel.style.display = 'block';
+        } catch (err) {
+          alert("文件解析失败，请确保是有效的 MusicFree JSON 备份文件！");
+        }
+      };
+      reader.readAsText(file, 'utf-8');
+    }
+
+    /**
+     * 深度解析备份结构中的所有歌单
+     */
+    function extractSheets(data) {
+      const sheets = [];
+      let uid = 0;
+
+      function traverse(obj, parentKey = '') {
+        if (!obj || typeof obj !== 'object') return;
+        if (Array.isArray(obj)) {
+          obj.forEach((item) => traverse(item, parentKey));
+          return;
+        }
+
+        // 识别歌单对象 (包含 musicList 数组)
+        if (obj.musicList && Array.isArray(obj.musicList)) {
+          const isFav = obj.id === 'favorite' || obj.title === '我喜欢的音乐' || parentKey === 'favorite';
+          const title = obj.title || (isFav ? '💖 我喜欢的音乐' : `未命名歌单 #${uid + 1}`);
+          let totalCount = 0;
+          let alreadyCount = 0;
+
+          obj.musicList.forEach((song) => {
+            if (song && typeof song === 'object' && (song.title || song.name)) {
+              totalCount++;
+              if (song.platform === '智能多源聚合') {
+                alreadyCount++;
+              }
+            }
+          });
+
+          sheets.push({
+            id: 'sheet_' + (++uid),
+            rawId: obj.id,
+            title: title,
+            isFavorite: isFav,
+            songsCount: totalCount,
+            alreadyCount: alreadyCount,
+            selected: true,
+            ref: obj,
+          });
+          return;
+        }
+
+        // 递归遍历子对象
+        for (const key of Object.keys(obj)) {
+          if (key !== 'downloadData') {
+            traverse(obj[key], key);
+          }
+        }
+      }
+
+      traverse(data);
+      return sheets;
+    }
+
+    function renderSheetList() {
+      sheetListEl.innerHTML = '';
+      detectedSheets.forEach((sheet, idx) => {
+        const itemEl = document.createElement('div');
+        itemEl.className = 'sheet-item' + (sheet.selected ? ' selected' : '');
+
+        const leftEl = document.createElement('div');
+        leftEl.className = 'sheet-item-left';
+
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.className = 'sheet-checkbox';
+        chk.checked = sheet.selected;
+
+        const nameEl = document.createElement('span');
+        nameEl.className = 'sheet-name';
+        nameEl.textContent = (sheet.isFavorite ? '💖 ' : '📁 ') + sheet.title.replace('💖 ', '');
+
+        leftEl.appendChild(chk);
+        leftEl.appendChild(nameEl);
+
+        const rightEl = document.createElement('div');
+        rightEl.style.display = 'flex';
+        rightEl.style.alignItems = 'center';
+
+        const badgeEl = document.createElement('span');
+        badgeEl.className = 'sheet-badge';
+        badgeEl.textContent = `${sheet.songsCount} 首`;
+
+        const statusBadge = document.createElement('span');
+        statusBadge.className = 'sheet-status-badge ' + (sheet.selected ? 'badge-convert' : 'badge-keep');
+        statusBadge.textContent = sheet.selected ? '换源' : '保持原样';
+
+        rightEl.appendChild(badgeEl);
+        rightEl.appendChild(statusBadge);
+
+        itemEl.appendChild(leftEl);
+        itemEl.appendChild(rightEl);
+
+        // 点击整行或勾选框触发切换
+        itemEl.addEventListener('click', (e) => {
+          if (e.target !== chk) {
+            chk.checked = !chk.checked;
+          }
+          sheet.selected = chk.checked;
+          if (sheet.selected) {
+            itemEl.classList.add('selected');
+            statusBadge.className = 'sheet-status-badge badge-convert';
+            statusBadge.textContent = '换源';
+          } else {
+            itemEl.classList.remove('selected');
+            statusBadge.className = 'sheet-status-badge badge-keep';
+            statusBadge.textContent = '保持原样';
+          }
+          updateStatistics();
+        });
+
+        sheetListEl.appendChild(itemEl);
+      });
+    }
+
+    function updateStatistics() {
+      let selectedSheets = 0;
+      let convertedSongs = 0;
+      let untouchedSongs = 0;
+      let alreadyAggregated = 0;
+
+      detectedSheets.forEach((sheet) => {
+        if (sheet.selected) {
+          selectedSheets++;
+          const toConvert = sheet.songsCount - sheet.alreadyCount;
+          convertedSongs += toConvert;
+          alreadyAggregated += sheet.alreadyCount;
+        } else {
+          untouchedSongs += sheet.songsCount;
+        }
+      });
+
+      selectedSheetCountEl.textContent = selectedSheets;
+      totalSheetCountEl.textContent = detectedSheets.length;
+      convertedSongCountEl.textContent = convertedSongs + " 首";
+      untouchedSongCountEl.textContent = untouchedSongs + " 首";
+      alreadyAggregatedCountEl.textContent = alreadyAggregated + " 首";
+    }
+
+    // 快捷操作
+    btnSelectAll.addEventListener('click', () => {
+      detectedSheets.forEach((s) => s.selected = true);
+      renderSheetList();
+      updateStatistics();
+    });
+
+    btnSelectNone.addEventListener('click', () => {
+      detectedSheets.forEach((s) => s.selected = false);
+      renderSheetList();
+      updateStatistics();
+    });
+
+    btnSelectFav.addEventListener('click', () => {
+      detectedSheets.forEach((s) => s.selected = s.isFavorite);
+      renderSheetList();
+      updateStatistics();
+    });
+
+    // 下载生成
+    downloadBtn.addEventListener('click', () => {
+      if (!parsedBackupData) return;
+
+      // 深度克隆原始数据
+      const clonedData = JSON.parse(JSON.stringify(parsedBackupData));
+      const sheetsInClone = extractSheets(clonedData);
+
+      // 根据用户的勾选状态精准修改
+      sheetsInClone.forEach((clonedSheet, idx) => {
+        const originalChoice = detectedSheets[idx];
+        if (originalChoice && originalChoice.selected && clonedSheet.ref && Array.isArray(clonedSheet.ref.musicList)) {
+          // 仅对用户勾选了的歌单进行换源修改
+          clonedSheet.ref.musicList.forEach((song) => {
+            if (song && typeof song === 'object' && (song.title || song.name)) {
+              if (song.duration || song.interval || song.dt) {
+                song.duration = formatDuration(song.duration || song.interval || song.dt);
+              }
+              if (song.platform !== '智能多源聚合') {
+                song._origPlatform = song.platform || "";
+                song.platform = '智能多源聚合';
+              }
+            }
+          });
+        }
+        // 未勾选的歌单中的歌曲完全保持原有 platform 与音源不变！
+      });
+
+      const convertedJsonString = JSON.stringify(clonedData, null, 2);
+      const blob = new Blob([convertedJsonString], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = originalFileName.replace('.json', '_auto_fallback.json');
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
