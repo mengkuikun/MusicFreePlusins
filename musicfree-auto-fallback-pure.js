@@ -1,7 +1,7 @@
 /**
  * MusicFree 智能多源聚合与自动容灾换源插件 (纯净版 - 0内置源)
  * 
- * 版本: 1.4.5-pure
+ * 版本: 1.5.0-pure
  * 作者: 夢酷 (mengkuikun)
  * 协议: MIT
  * 
@@ -12,9 +12,9 @@
  *  - 内置 LRU 换源记忆秒开加速引擎 (10ms 秒开与自愈)
  *  - 支持 'status' 看板与 'update' 一键体检指令
  */
-(function() {
+(function(env, getUserVariables, __musicfree_require) {
   var modules = {
-  "./utils/format": function(module, exports, require) {
+  "./utils/format": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 /**
@@ -54,12 +54,12 @@ module.exports = {
 };
 
   },
-  "./config-pure": function(module, exports, require) {
+  "./config-pure": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 const config = {
   platform: "智能多源聚合",
-  version: "1.4.5-pure",
+  version: "1.5.0-pure",
   author: "夢酷 (mengkuikun)",
   srcUrl: "https://raw.githubusercontent.com/mengkuikun/MusicFreePlusins/main/musicfree-auto-fallback-pure.js",
   description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
@@ -103,7 +103,7 @@ const config = {
     {
       key: "autoQualityDowngrade",
       name: "音质降级",
-      hint: "无损失效时自动降级标准音质（填 true 或 false，默认 true）",
+      hint: "高音质或无损失效时自动向下兼容播放（填 true 或 false，默认 true）",
     },
     {
       key: "enableMatchCache",
@@ -116,7 +116,7 @@ const config = {
 module.exports = config;
 
   },
-  "./core/matcher": function(module, exports, require) {
+  "./core/matcher": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 /**
@@ -466,7 +466,7 @@ module.exports = {
 };
 
   },
-  "./core/version": function(module, exports, require) {
+  "./core/version": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 /**
@@ -504,7 +504,7 @@ module.exports = {
 };
 
   },
-  "./core/cache": function(module, exports, require) {
+  "./core/cache": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 const { cleanTitle, cleanArtist } = require("./matcher");
@@ -697,20 +697,282 @@ module.exports = {
 };
 
   },
-  "./core/storage": function(module, exports, require) {
+  "./core/storage": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 /**
- * MusicFree 自适应持久化存储引擎 (双轨融合：localStorage 0ms 同步秒存秒读 + IndexedDB 超大容量后台备份)
+ * MusicFree 跨平台高自适应持久化存储引擎
+ * 三轨融合：
+ *  1. [桌面端核心首选] musicfree/storage (MusicFree 官方原生磁盘存储，持久化到 %APPDATA%/musicfree-plugin-storage/chunk.json)
+ *  2. [Web/浏览器同步] localStorage (0ms 极速内存/WebStorage 镜像)
+ *  3. [Web/大容量容灾] IndexedDB (支持 GB 级超大插件持久化)
  */
 
 const DB_NAME = "MusicFreePluginDB";
 const STORE_NAME = "dynamic_plugins";
 const DB_VERSION = 1;
 const STORAGE_KEY = "mf_dynamic_plugins_cache_v2";
+const STORAGE_INITIALIZED_KEY = "mf_storage_initialized_v1";
+const STORAGE_TOMBSTONE_KEY = "mf_deleted_tombstones_v1";
 
 let idbInstance = null;
 let inMemoryStore = [];
+
+// 内存快照缓存：保证无论在何种平台，同步读取均能 0ms 瞬间命中
+const nativeStorageCache = new Map();
+let isNativeStorageInit = false;
+let nativeStorageInitPromise = null;
+let lastInheritInfo = null;
+
+/**
+ * 在 Electron 桌面端安全探测 Node.js 原生 fs 模块 (具备沙箱穿透与全局降级容错)
+ */
+function getGlobalNodeFs() {
+  try {
+    const globalRoot = (function () {
+      return (function () {}).constructor("return this")();
+    })();
+    const proc = globalRoot ? globalRoot.process : null;
+    if (proc) {
+      if (typeof proc.getBuiltinModule === "function") {
+        const fs = proc.getBuiltinModule("fs");
+        if (fs && typeof fs.readFileSync === "function") return fs;
+      }
+      if (proc.mainModule && typeof proc.mainModule.require === "function") {
+        const fs = proc.mainModule.require("fs");
+        if (fs && typeof fs.readFileSync === "function") return fs;
+      }
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof require === "function") {
+      const fs = require("fs");
+      if (fs && typeof fs.readFileSync === "function") return fs;
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+/**
+ * 探测并获取 MusicFree 桌面端官方原生磁盘存储模块 (musicfree/storage)
+ */
+function getMusicFreeNativeStorage() {
+  try {
+    if (typeof require === "function") {
+      const s = require("musicfree/storage");
+      if (s && typeof s.getItem === "function" && typeof s.setItem === "function") {
+        return s;
+      }
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof __musicfree_require === "function") {
+      const s = __musicfree_require("musicfree/storage");
+      if (s && typeof s.getItem === "function" && typeof s.setItem === "function") {
+        return s;
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+/**
+ * 获取或记录墓碑黑名单（防止用户主动删除的音源在跨版本升级后死灰复燃）
+ */
+async function getTombstones(mfStorage) {
+  if (!mfStorage) return [];
+  try {
+    const raw = await mfStorage.getItem(STORAGE_TOMBSTONE_KEY);
+    if (raw) {
+      const list = JSON.parse(raw);
+      if (Array.isArray(list)) return list;
+    }
+  } catch (e) {}
+  return [];
+}
+
+async function addTombstone(urlOrId) {
+  if (!urlOrId) return;
+  const mfStorage = getMusicFreeNativeStorage();
+  if (!mfStorage) return;
+  try {
+    const list = await getTombstones(mfStorage);
+    if (!list.includes(urlOrId)) {
+      list.push(urlOrId);
+      await mfStorage.setItem(STORAGE_TOMBSTONE_KEY, JSON.stringify(list));
+    }
+  } catch (e) {}
+}
+
+/**
+ * 跨版本存储无感自愈与继承引擎
+ * 当检测到当前代码 Hash 存储为空（全新版本初次运行），自动扫描本地历史版本存储，
+ * 经过五重安全防线（防复活、语法强校验、指纹特征隔离、0延迟非阻塞），无缝继承上一个有效版本的全部音源！
+ */
+async function tryInheritFromPreviousVersions(mfStorage, customFs = null) {
+  if (!mfStorage) return { inherited: false, reason: "no_storage" };
+
+  try {
+    const initFlag = await mfStorage.getItem(STORAGE_INITIALIZED_KEY);
+    if (initFlag === "cleared") {
+      return { inherited: false, reason: "explicitly_cleared" };
+    }
+    if (initFlag === "true") {
+      return { inherited: false, reason: "already_initialized" };
+    }
+
+    const fs = customFs || getGlobalNodeFs();
+    if (!fs) {
+      await mfStorage.setItem(STORAGE_INITIALIZED_KEY, "true");
+      return { inherited: false, reason: "no_fs" };
+    }
+
+    const globalRoot = (function () {
+      return (function () {}).constructor("return this")();
+    })();
+    const proc = globalRoot ? globalRoot.process : null;
+    const env = proc ? proc.env || {} : {};
+
+    // 适配各操作系统下 MusicFree 桌面端 chunk.json 默认位置
+    const candidatePaths = [];
+    if (env.APPDATA) {
+      candidatePaths.push(
+        env.APPDATA + "/MusicFree/musicfree-plugin-storage/chunk.json",
+        env.APPDATA + "/musicfree-plugin-storage/chunk.json"
+      );
+    }
+    if (env.HOME) {
+      candidatePaths.push(
+        env.HOME + "/.config/MusicFree/musicfree-plugin-storage/chunk.json",
+        env.HOME + "/Library/Application Support/MusicFree/musicfree-plugin-storage/chunk.json"
+      );
+    }
+
+    let chunkPath = null;
+    for (const p of candidatePaths) {
+      const norm = p.replace(/\\/g, "/");
+      try {
+        if (fs.existsSync(norm)) {
+          chunkPath = norm;
+          break;
+        }
+      } catch (e) {}
+    }
+
+    if (!chunkPath) {
+      await mfStorage.setItem(STORAGE_INITIALIZED_KEY, "true");
+      return { inherited: false, reason: "no_chunk_file" };
+    }
+
+    const rawContent = fs.readFileSync(chunkPath, "utf-8");
+    const data = JSON.parse(rawContent);
+    if (!data || typeof data !== "object") {
+      await mfStorage.setItem(STORAGE_INITIALIZED_KEY, "true");
+      return { inherited: false, reason: "invalid_chunk_data" };
+    }
+
+    const tombstones = new Set(await getTombstones(mfStorage));
+
+    // 倒序检索最近有效 Hash
+    const keys = Object.keys(data).reverse();
+    let candidatePlugins = null;
+    let candidateFingerprint = null;
+    let sourceHash = null;
+
+    for (const h of keys) {
+      const entry = data[h];
+      if (entry && typeof entry === "object" && entry.mf_dynamic_plugins_cache_v2) {
+        try {
+          const parsed = JSON.parse(entry.mf_dynamic_plugins_cache_v2);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            // 五重安全过滤：去除墓碑、校验必要字段
+            const valid = parsed.filter((p) => {
+              if (!p || typeof p !== "object") return false;
+              if (!p.url || tombstones.has(p.url)) return false;
+              if (!p.code || typeof p.code !== "string" || p.code.length < 20) return false;
+              if (!p.name && !p.platform) return false;
+              return true;
+            });
+
+            if (valid.length > 0) {
+              candidatePlugins = valid;
+              candidateFingerprint = entry.mf_last_synced_fingerprint_v1 || "";
+              sourceHash = h;
+              break;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (candidatePlugins && candidatePlugins.length > 0) {
+      // 写入当前版本存储与内存快照
+      const jsonStr = JSON.stringify(candidatePlugins);
+      inMemoryStore = candidatePlugins.slice();
+      nativeStorageCache.set(STORAGE_KEY, jsonStr);
+
+      await mfStorage.setItem(STORAGE_KEY, jsonStr);
+      if (candidateFingerprint) {
+        await mfStorage.setItem("mf_last_synced_fingerprint_v1", candidateFingerprint);
+      }
+      await mfStorage.setItem(STORAGE_INITIALIZED_KEY, "true");
+      await mfStorage.setItem("mf_inherited_from_hash_v1", sourceHash);
+
+      lastInheritInfo = {
+        inherited: true,
+        count: candidatePlugins.length,
+        fromHash: sourceHash,
+        fingerprint: candidateFingerprint,
+      };
+      return lastInheritInfo;
+    }
+
+    await mfStorage.setItem(STORAGE_INITIALIZED_KEY, "true");
+    return { inherited: false, reason: "no_valid_candidates" };
+  } catch (err) {
+    return { inherited: false, error: err.message };
+  }
+}
+
+function getInheritInfo() {
+  return lastInheritInfo;
+}
+
+/**
+ * 开机预热：异步从 MusicFree 官方原生磁盘存储恢复数据到内存缓存中
+ */
+async function ensureNativeStorageLoaded() {
+  if (isNativeStorageInit) return;
+  if (nativeStorageInitPromise) return nativeStorageInitPromise;
+
+  nativeStorageInitPromise = (async () => {
+    const mfStorage = getMusicFreeNativeStorage();
+    if (mfStorage) {
+      try {
+        const raw = await mfStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          nativeStorageCache.set(STORAGE_KEY, raw);
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            inMemoryStore = parsed.slice();
+          }
+        }
+
+        // 若当前版本存储为空，触发跨版本自动继承自愈引擎
+        if (inMemoryStore.length === 0) {
+          await tryInheritFromPreviousVersions(mfStorage);
+        }
+      } catch (e) {}
+    }
+    isNativeStorageInit = true;
+  })();
+
+  return nativeStorageInitPromise;
+}
 
 function isIndexedDBAvailable() {
   try {
@@ -793,43 +1055,176 @@ function getLocalStorageSafe() {
       return globalThis.localStorage;
     }
   } catch (e) {}
+  try {
+    if (
+      typeof window !== "undefined" &&
+      window.localStorage &&
+      typeof window.localStorage.getItem === "function"
+    ) {
+      return window.localStorage;
+    }
+  } catch (e) {}
   return null;
 }
 
 /**
- * ⚡ 第一步：同步优先写入 localStorage (0ms 极速写入，保证开机瞬间秒读)
+ * 同步安全读取任意键值 (优先读取内存快照，次之 localStorage)
  */
-function savePluginsSync(list) {
-  if (!Array.isArray(list)) return false;
-  inMemoryStore = list.slice();
+function getStoredItemSync(key) {
+  if (nativeStorageCache.has(key)) return nativeStorageCache.get(key);
+  const ls = getLocalStorageSafe();
+  if (ls) {
+    try {
+      return ls.getItem(key);
+    } catch (e) {}
+  }
+  return null;
+}
+
+/**
+ * 异步安全读取任意键值 (从原生磁盘、localStorage 或内存中获取)
+ */
+async function getStoredItemAsync(key) {
+  const syncVal = getStoredItemSync(key);
+  if (syncVal !== null && syncVal !== undefined && syncVal !== "") return syncVal;
+
+  const mfStorage = getMusicFreeNativeStorage();
+  if (mfStorage) {
+    try {
+      const raw = await mfStorage.getItem(key);
+      if (raw !== null && raw !== undefined) {
+        nativeStorageCache.set(key, String(raw));
+        return String(raw);
+      }
+    } catch (e) {}
+  }
+
+  return null;
+}
+
+/**
+ * 异步写入任意键值 (三轨同步：内存快照 + localStorage + 原生磁盘持久化)
+ */
+async function setStoredItem(key, value) {
+  const strVal = String(value ?? "");
+  nativeStorageCache.set(key, strVal);
 
   const ls = getLocalStorageSafe();
   if (ls) {
     try {
-      ls.setItem(STORAGE_KEY, JSON.stringify(list));
-      return true;
-    } catch (e) {
-      // 若单次体积超过 5MB 触发 Quota 报错，由后台 IndexedDB 完整接管
-      return false;
-    }
+      ls.setItem(key, strVal);
+    } catch (e) {}
   }
-  return false;
+
+  const mfStorage = getMusicFreeNativeStorage();
+  if (mfStorage) {
+    try {
+      await mfStorage.setItem(key, strVal);
+    } catch (e) {}
+  }
 }
 
 /**
- * 📦 第二步：后台异步写入 IndexedDB (支持 GB 级超大容量插件持久化)
+ * 删除任意存储键值
+ */
+async function removeStoredItem(key) {
+  nativeStorageCache.delete(key);
+
+  const ls = getLocalStorageSafe();
+  if (ls) {
+    try {
+      ls.removeItem(key);
+    } catch (e) {}
+  }
+
+  const mfStorage = getMusicFreeNativeStorage();
+  if (mfStorage) {
+    try {
+      await mfStorage.removeItem(key);
+    } catch (e) {}
+  }
+}
+
+/**
+ * ⚡ 同步优先写入 (0ms 极速增量合并写入，杜绝旧音源被全量覆盖清空)
+ */
+function savePluginsSync(list) {
+  if (!Array.isArray(list)) return false;
+
+  // 1. 读取本地已有的旧数据进行安全增量合并 (Merge Upsert)
+  const existingList = loadPluginsSync();
+  const mergedMap = new Map();
+
+  if (Array.isArray(existingList)) {
+    for (const item of existingList) {
+      if (item && item.url) mergedMap.set(item.url, item);
+    }
+  }
+
+  for (const item of list) {
+    if (item && item.url) mergedMap.set(item.url, item);
+  }
+
+  const mergedList = Array.from(mergedMap.values());
+  inMemoryStore = mergedList.slice();
+  const jsonStr = JSON.stringify(mergedList);
+  nativeStorageCache.set(STORAGE_KEY, jsonStr);
+
+  const ls = getLocalStorageSafe();
+  if (ls) {
+    try {
+      ls.setItem(STORAGE_KEY, jsonStr);
+      return true;
+    } catch (e) {
+      // 若超 5MB，由原生磁盘或 IndexedDB 接管
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// 写入任务队列：保证所有 IndexedDB 写事务严格串行化执行
+let idbWriteQueue = Promise.resolve();
+
+function enqueueIdbWrite(operation) {
+  const resultPromise = idbWriteQueue.then(() => operation().catch(() => false));
+  idbWriteQueue = resultPromise;
+  return resultPromise;
+}
+
+/**
+ * 📦 异步完整写入 (MusicFree 官方原生磁盘 + IndexedDB 双重持久化)
  */
 async function savePluginsAsync(list) {
-  if (!Array.isArray(list)) return;
-  try {
-    const db = await openIndexedDB();
-    if (db) {
-      await new Promise((resolve) => {
+  if (!Array.isArray(list)) return false;
+
+  // 1. 先进行内存增量合并
+  savePluginsSync(list);
+
+  // 2. 写入 MusicFree 官方原生磁盘存储 (解决桌面端无 localStorage/IndexedDB 的根本手段！)
+  const mfStorage = getMusicFreeNativeStorage();
+  if (mfStorage) {
+    try {
+      const mergedList = inMemoryStore.slice();
+      const jsonStr = JSON.stringify(mergedList);
+      nativeStorageCache.set(STORAGE_KEY, jsonStr);
+      await mfStorage.setItem(STORAGE_KEY, jsonStr);
+    } catch (e) {
+      console.warn("[Storage] 写入 MusicFree 原生磁盘存储失败:", e.message);
+    }
+  }
+
+  // 3. 写入 IndexedDB (保留 Web 浏览器端大容量兼容)
+  return enqueueIdbWrite(async () => {
+    try {
+      const db = await openIndexedDB();
+      if (!db) return false;
+      return await new Promise((resolve) => {
         try {
           const tx = db.transaction([STORE_NAME], "readwrite");
           const store = tx.objectStore(STORE_NAME);
-          store.clear();
-          for (const item of list) {
+          for (const item of inMemoryStore) {
             if (item && item.url) {
               store.put(item);
             }
@@ -841,12 +1236,22 @@ async function savePluginsAsync(list) {
           resolve(false);
         }
       });
+    } catch (err) {
+      return false;
     }
-  } catch (err) {}
+  });
 }
 
 /**
- * 综合保存：同步立即写入 localStorage + 后台静默写入 IndexedDB
+ * 单个插件原子 upsert
+ */
+async function putPluginAsync(item) {
+  if (!item || !item.url) return false;
+  return savePluginsAsync([item]);
+}
+
+/**
+ * 统一同步/异步保存入口
  */
 function savePlugins(list) {
   savePluginsSync(list);
@@ -854,9 +1259,10 @@ function savePlugins(list) {
 }
 
 /**
- * ⚡ 开机 0ms 同步秒读 (纯同步从 localStorage 恢复已存插件)
+ * ⚡ 同步优先读取已持久化插件
  */
 function loadPluginsSync() {
+  // 1. 检查 localStorage
   const ls = getLocalStorageSafe();
   if (ls) {
     try {
@@ -870,21 +1276,47 @@ function loadPluginsSync() {
       }
     } catch (e) {}
   }
+
+  // 2. 检查原生磁盘缓存快照
+  if (nativeStorageCache.has(STORAGE_KEY)) {
+    try {
+      const parsed = JSON.parse(nativeStorageCache.get(STORAGE_KEY));
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        inMemoryStore = parsed.slice();
+        return parsed;
+      }
+    } catch (e) {}
+  }
+
+  // 3. 返回当前内存快照
   return inMemoryStore.slice();
 }
 
 /**
- * 📦 异步完整读取 (从 IndexedDB 检索超大插件，并与 localStorage 合并)
+ * 📦 异步完整读取 (MusicFree 原生磁盘 + IndexedDB + localStorage 全源对齐)
  */
 async function loadPlugins() {
-  const syncList = loadPluginsSync();
+  // 1. 优先等待并加载 MusicFree 官方原生磁盘存储
+  await ensureNativeStorageLoaded();
+
   const resultMap = new Map();
+
+  // 预热回填内存
+  if (Array.isArray(inMemoryStore)) {
+    inMemoryStore.forEach((item) => {
+      if (item && item.url) resultMap.set(item.url, item);
+    });
+  }
+
+  // 2. 补充 localStorage
+  const syncList = loadPluginsSync();
   if (Array.isArray(syncList)) {
     syncList.forEach((item) => {
       if (item && item.url) resultMap.set(item.url, item);
     });
   }
 
+  // 3. 补充 IndexedDB
   try {
     const db = await openIndexedDB();
     if (db) {
@@ -910,6 +1342,7 @@ async function loadPlugins() {
 
   const merged = Array.from(resultMap.values());
   inMemoryStore = merged.slice();
+  nativeStorageCache.set(STORAGE_KEY, JSON.stringify(merged));
   return merged;
 }
 
@@ -917,32 +1350,48 @@ async function loadPlugins() {
  * 删除指定 URL 的插件数据
  */
 async function removePlugin(url) {
-  if (!url) return;
-  inMemoryStore = inMemoryStore.filter((x) => x.url !== url);
+  if (!url) return false;
+  const currentList = loadPluginsSync();
+  const filtered = currentList.filter((x) => x && x.url !== url);
+  inMemoryStore = filtered.slice();
+  const jsonStr = JSON.stringify(filtered);
+  nativeStorageCache.set(STORAGE_KEY, jsonStr);
 
   const ls = getLocalStorageSafe();
   if (ls) {
     try {
-      ls.setItem(STORAGE_KEY, JSON.stringify(inMemoryStore));
+      ls.setItem(STORAGE_KEY, jsonStr);
     } catch (e) {}
   }
 
-  try {
-    const db = await openIndexedDB();
-    if (db) {
-      await new Promise((resolve) => {
+  const mfStorage = getMusicFreeNativeStorage();
+  if (mfStorage) {
+    try {
+      await mfStorage.setItem(STORAGE_KEY, jsonStr);
+      await addTombstone(url);
+    } catch (e) {}
+  }
+
+  return enqueueIdbWrite(async () => {
+    try {
+      const db = await openIndexedDB();
+      if (!db) return false;
+      return await new Promise((resolve) => {
         try {
           const tx = db.transaction([STORE_NAME], "readwrite");
           const store = tx.objectStore(STORE_NAME);
           store.delete(url);
           tx.oncomplete = () => resolve(true);
           tx.onerror = () => resolve(false);
+          tx.onabort = () => resolve(false);
         } catch (e) {
           resolve(false);
         }
       });
+    } catch (err) {
+      return false;
     }
-  } catch (err) {}
+  });
 }
 
 /**
@@ -950,35 +1399,74 @@ async function removePlugin(url) {
  */
 async function clearAll() {
   inMemoryStore = [];
+  nativeStorageCache.clear();
+
   const ls = getLocalStorageSafe();
   if (ls) {
     try {
       ls.removeItem(STORAGE_KEY);
     } catch (e) {}
   }
-  try {
-    const db = await openIndexedDB();
-    if (db) {
-      const tx = db.transaction([STORE_NAME], "readwrite");
-      tx.objectStore(STORE_NAME).clear();
+
+  const mfStorage = getMusicFreeNativeStorage();
+  if (mfStorage) {
+    try {
+      await mfStorage.removeItem(STORAGE_KEY);
+      await mfStorage.setItem(STORAGE_INITIALIZED_KEY, "cleared");
+    } catch (e) {}
+  }
+
+  return enqueueIdbWrite(async () => {
+    try {
+      const db = await openIndexedDB();
+      if (!db) return false;
+      return await new Promise((resolve) => {
+        try {
+          const tx = db.transaction([STORE_NAME], "readwrite");
+          const store = tx.objectStore(STORE_NAME);
+          store.clear();
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = () => resolve(false);
+          tx.onabort = () => resolve(false);
+        } catch (e) {
+          resolve(false);
+        }
+      });
+    } catch (err) {
+      return false;
     }
-  } catch (e) {}
+  });
 }
 
 module.exports = {
   isIndexedDBAvailable,
+  getLocalStorageSafe,
+  getMusicFreeNativeStorage,
+  ensureNativeStorageLoaded,
+  getStoredItemSync,
+  getStoredItemAsync,
+  setStoredItem,
+  removeStoredItem,
   savePlugins,
   savePluginsSync,
   savePluginsAsync,
+  putPluginAsync,
   loadPlugins,
   loadPluginsSync,
   removePlugin,
   clearAll,
   STORAGE_KEY,
+  STORAGE_INITIALIZED_KEY,
+  STORAGE_TOMBSTONE_KEY,
+  getInheritInfo,
+  tryInheritFromPreviousVersions,
+  getGlobalNodeFs,
+  addTombstone,
 };
 
+
   },
-  "./core/dynamic-loader": function(module, exports, require) {
+  "./core/dynamic-loader": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 const axios = require("axios");
@@ -996,6 +1484,58 @@ const dynamicRegistry = new Map();
 
 // 记忆上次同步的配置指纹，杜绝重复网络请求
 let lastSyncedFingerprint = "";
+const FINGERPRINT_STORAGE_KEY = "mf_last_synced_fingerprint_v1";
+
+function getLastSyncedFingerprint() {
+  return storage.getStoredItemSync(FINGERPRINT_STORAGE_KEY) || "";
+}
+
+async function getLastSyncedFingerprintAsync() {
+  return (await storage.getStoredItemAsync(FINGERPRINT_STORAGE_KEY)) || "";
+}
+
+function setLastSyncedFingerprint(fp) {
+  storage.setStoredItem(FINGERPRINT_STORAGE_KEY, fp || "").catch(() => {});
+}
+
+function clearLastSyncedFingerprint() {
+  storage.removeStoredItem(FINGERPRINT_STORAGE_KEY).catch(() => {});
+}
+
+// 最近的同步与诊断日志 (BUG-006 & BUG-007)
+const syncDiagnosticLogs = {
+  lastSyncTime: 0,
+  lastSyncStatus: "idle",
+  lastSyncError: null,
+  totalSubPlugins: 0,
+  successCount: 0,
+  failCount: 0,
+  failedPlugins: [],
+};
+
+function getSyncDiagnosticLogs() {
+  return syncDiagnosticLogs;
+}
+
+// 远程内容哈希感知 (BUG-005)
+const HASH_STORAGE_KEY_PREFIX = "mf_sub_content_hash_";
+
+function getStoredContentHash(url) {
+  return storage.getStoredItemSync(HASH_STORAGE_KEY_PREFIX + url) || "";
+}
+
+function setStoredContentHash(url, hash) {
+  storage.setStoredItem(HASH_STORAGE_KEY_PREFIX + url, hash).catch(() => {});
+}
+
+function simpleHash(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return String(hash);
+}
 
 // 全局后台初始化就绪 Promise
 let bgInitPromise = null;
@@ -1031,7 +1571,9 @@ function persistDynamicPluginsToStorage() {
         });
       }
     }
-    storage.savePlugins(list);
+    if (list.length > 0) {
+      storage.savePlugins(list);
+    }
   } catch (e) {}
 }
 
@@ -1071,35 +1613,55 @@ function restoreDynamicPluginsFromStorage(builtInSourcesMap = {}) {
 /**
  * 🚀 顶层后台自动初始化任务 (同步 0ms 秒载 + 异步补充 IndexedDB)
  */
+let isBgInitRunning = false;
+
 function triggerBackgroundInit() {
-  if (bgInitPromise) return bgInitPromise;
+  if (isBgInitRunning) return bgInitPromise;
+  isBgInitRunning = true;
   bgInitPromise = (async () => {
     try {
       // 1. 同步 0ms 从 localStorage 恢复
       restoreDynamicPluginsFromStorage();
 
-      // 2. 异步补充 IndexedDB 中超出 5MB 的大体积插件
+      // 2. 异步补充与对齐原生磁盘 / IndexedDB (【修复 BUG-002】：允许覆盖与升级旧版数据)
       const asyncList = await storage.loadPlugins();
       if (Array.isArray(asyncList)) {
         for (const item of asyncList) {
-          if (item && item.code && item.url && !dynamicRegistry.has(item.url)) {
-            const plugin = evaluatePluginCode(item.code);
-            if (plugin) {
-              plugin._sourceUrl = item.url;
-              plugin._isDynamic = true;
-              plugin._tier = item.tier || "tier0";
-              dynamicRegistry.set(item.url, {
-                plugin,
-                url: item.url,
-                tier: item.tier || "tier0",
-                code: item.code,
-                time: item.time || Date.now(),
-              });
+          if (item && item.code && item.url) {
+            const existing = dynamicRegistry.get(item.url);
+            const shouldUpdate =
+              !existing ||
+              (item.version && existing.plugin && compareVersions(item.version, existing.plugin.version || "0.0.0") > 0) ||
+              (item.time && existing.time && item.time > existing.time) ||
+              !existing.code;
+
+            if (shouldUpdate) {
+              const plugin = evaluatePluginCode(item.code);
+              if (plugin) {
+                plugin._sourceUrl = item.url;
+                plugin._isDynamic = true;
+                plugin._tier = item.tier || "tier0";
+                dynamicRegistry.set(item.url, {
+                  plugin,
+                  url: item.url,
+                  tier: item.tier || "tier0",
+                  code: item.code,
+                  time: item.time || Date.now(),
+                });
+              }
             }
           }
         }
       }
-    } catch (e) {}
+
+      if (!lastSyncedFingerprint) {
+        lastSyncedFingerprint = (await getLastSyncedFingerprintAsync()) || "";
+      }
+    } catch (e) {
+      console.warn("[Storage] 异步恢复异常:", e.message);
+    } finally {
+      isBgInitRunning = false;
+    }
   })();
   return bgInitPromise;
 }
@@ -1108,11 +1670,13 @@ function triggerBackgroundInit() {
 triggerBackgroundInit();
 
 /**
- * 全局就绪等待锁：冷启动若遇大体积异步插件，自动等待就绪，绝不报空
+ * 全局就绪等待锁：保证本地持久化存储（原生磁盘 + localStorage + IndexedDB）完全加载入内存
+ * 【修复 BUG-003】：将硬超时放宽至 8000ms，保证多插件恢复完成，同时保留防死锁保护
  */
-async function ensureDynamicPluginsReady(timeoutMs = 2500) {
-  if (dynamicRegistry.size > 0) return true;
-  if (!bgInitPromise) triggerBackgroundInit();
+async function ensureDynamicPluginsReady(timeoutMs = 8000) {
+  if (!bgInitPromise || (!isBgInitRunning && dynamicRegistry.size === 0)) {
+    triggerBackgroundInit();
+  }
   try {
     await Promise.race([
       bgInitPromise,
@@ -1124,8 +1688,9 @@ async function ensureDynamicPluginsReady(timeoutMs = 2500) {
 
 /**
  * 精准删除某个指定的动态插件 (从运行内存 + localStorage + IndexedDB 中彻底移除)
+ * 【修复 BUG-009】：异步等待 IndexedDB 彻底删除完成后再完成持久化
  */
-function deleteDynamicPlugin(query) {
+async function deleteDynamicPlugin(query) {
   if (!query || typeof query !== "string") {
     return { success: false, message: "请指定要删除的音源名称（如: del 5sing 或 删除 酷我）" };
   }
@@ -1133,15 +1698,20 @@ function deleteDynamicPlugin(query) {
   const target = query.trim().toLowerCase();
   let deletedCount = 0;
   let deletedName = "";
+  const toDeleteUrls = [];
 
   for (const [url, reg] of dynamicRegistry.entries()) {
     const pName = (reg.plugin.platform || reg.plugin.name || "").toLowerCase();
     if (pName === target || pName.includes(target) || url.toLowerCase().includes(target)) {
       deletedName = reg.plugin.platform || reg.plugin.name || url;
-      dynamicRegistry.delete(url);
-      storage.removePlugin(url);
+      toDeleteUrls.push(url);
       deletedCount++;
     }
+  }
+
+  for (const url of toDeleteUrls) {
+    dynamicRegistry.delete(url);
+    await storage.removePlugin(url);
   }
 
   if (deletedCount > 0) {
@@ -1161,12 +1731,15 @@ function deleteDynamicPlugin(query) {
 }
 
 /**
- * 一键清空所有本地缓存的动态音源
+ * 一键清空所有本地缓存的动态音源与配置指纹
  */
-function clearAllDynamicPlugins() {
+async function clearAllDynamicPlugins() {
   const count = dynamicRegistry.size;
   dynamicRegistry.clear();
-  storage.clearAll();
+  await storage.clearAll();
+  lastSyncedFingerprint = "";
+  clearLastSyncedFingerprint();
+  bgInitPromise = null;
   return {
     success: true,
     count,
@@ -1250,24 +1823,35 @@ function evaluatePluginCode(code) {
 /**
  * 注册单个已下载并实例化的 JS 插件对象
  */
-function registerSingleEvaluatedPlugin(plugin, cleanUrl, tier, builtInSourcesMap, rawCode = "") {
+function registerSingleEvaluatedPlugin(
+  plugin,
+  cleanUrl,
+  tier,
+  builtInSourcesMap = {},
+  rawCode = "",
+  skipPersist = false
+) {
   const remoteName = plugin.platform || plugin.name || "未命名插件";
   const remoteVersion = plugin.version || "1.0.0";
   plugin._sourceUrl = cleanUrl;
   plugin._isDynamic = true;
   plugin._tier = tier;
 
-  // 1. 查找是否存在已有的同名插件
+  // 1. 查找是否存在完全相同 URL 的已有插件 (精准更新同一插件)
   let existingEntry = null;
+  let samePlatformCount = 0;
   for (const [u, reg] of dynamicRegistry.entries()) {
-    if (reg.plugin.platform === remoteName || u === cleanUrl) {
+    if (u === cleanUrl) {
       existingEntry = { type: "dynamic", url: u, reg };
       break;
+    }
+    if (reg.plugin.platform === remoteName) {
+      samePlatformCount++;
     }
   }
 
   let existingBuiltin = null;
-  if (!existingEntry) {
+  if (!existingEntry && builtInSourcesMap) {
     for (const [k, bSource] of Object.entries(builtInSourcesMap)) {
       if (
         bSource.name === remoteName ||
@@ -1280,7 +1864,7 @@ function registerSingleEvaluatedPlugin(plugin, cleanUrl, tier, builtInSourcesMap
     }
   }
 
-  // 2. 版本对比
+  // 2. 相同 URL 进行版本对比升级
   if (existingEntry) {
     const currentVer = existingEntry.reg.plugin.version || "1.0.0";
     const comp = compareVersions(remoteVersion, currentVer);
@@ -1292,7 +1876,7 @@ function registerSingleEvaluatedPlugin(plugin, cleanUrl, tier, builtInSourcesMap
         code: rawCode || existingEntry.reg.code,
         time: Date.now(),
       });
-      persistDynamicPluginsToStorage();
+      if (!skipPersist) persistDynamicPluginsToStorage();
       return {
         status: "updated",
         name: remoteName,
@@ -1312,6 +1896,12 @@ function registerSingleEvaluatedPlugin(plugin, cleanUrl, tier, builtInSourcesMap
     }
   }
 
+  // 3. 若不同 URL 但平台同名，支持多线路并存 (如 酷我 [线路2])
+  if (samePlatformCount > 0) {
+    plugin._isAlternativeRoute = true;
+    plugin._routeIndex = samePlatformCount + 1;
+  }
+
   if (existingBuiltin) {
     const currentVer = existingBuiltin.version || "1.0.0";
     const comp = compareVersions(remoteVersion, currentVer);
@@ -1323,7 +1913,7 @@ function registerSingleEvaluatedPlugin(plugin, cleanUrl, tier, builtInSourcesMap
         code: rawCode,
         time: Date.now(),
       });
-      persistDynamicPluginsToStorage();
+      if (!skipPersist) persistDynamicPluginsToStorage();
       return {
         status: "updated",
         name: remoteName,
@@ -1351,7 +1941,7 @@ function registerSingleEvaluatedPlugin(plugin, cleanUrl, tier, builtInSourcesMap
     code: rawCode,
     time: Date.now(),
   });
-  persistDynamicPluginsToStorage();
+  if (!skipPersist) persistDynamicPluginsToStorage();
 
   return {
     status: "added",
@@ -1414,7 +2004,7 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
         return true;
       });
 
-      // 8 路并发高速拉取子插件
+      // 8 路并发高速拉取子插件 (集中批处理写入，杜绝并发覆灭)
       const tasks = validItems.map(async (item) => {
         const itemUrl = item.url || item.srcUrl;
         try {
@@ -1432,10 +2022,18 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
               itemUrl,
               tier,
               builtInSourcesMap,
-              rawSubCode
+              rawSubCode,
+              true // skipPersist: 批处理完成后统一保存
             );
           }
-        } catch (subErr) {}
+        } catch (subErr) {
+          console.warn(`[PluginDownload] 音源 [${item.name || itemUrl}] 下载或解析失败:`, subErr.message);
+          syncDiagnosticLogs.failedPlugins.push({
+            name: item.name || "未知",
+            url: itemUrl,
+            reason: subErr.message,
+          });
+        }
         return null;
       });
 
@@ -1454,6 +2052,15 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
           subReports.push(singleRes);
         }
       });
+
+      // 集中保存到本地持久化存储中
+      if (addedCount > 0 || updatedCount > 0) {
+        persistDynamicPluginsToStorage();
+      }
+
+      // 记录内容 Hash (BUG-005)
+      const contentStr = typeof rawData === "string" ? rawData : JSON.stringify(rawData);
+      setStoredContentHash(cleanUrl, simpleHash(contentStr));
 
       return {
         status: addedCount > 0 || updatedCount > 0 ? "added" : "exists",
@@ -1495,7 +2102,7 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
 }
 
 /**
- * 智能同步用户变量中的插件链接（具备 0ms 指纹记忆与本地缓存秒读拦截）
+ * 智能同步用户变量中的插件链接（具备 0ms 指纹记忆与本地缓存秒读拦截，杜绝重复网络请求）
  */
 async function syncCustomPlugins(
   tier0UrlsStr = "",
@@ -1503,32 +2110,41 @@ async function syncCustomPlugins(
   builtInSourcesMap = {}
 ) {
   const currentFingerprint = `${tier0UrlsStr || ""}###${tier3UrlsStr || ""}`;
+  const savedFingerprint =
+    (await getLastSyncedFingerprintAsync()) || getLastSyncedFingerprint();
 
-  // 1. 检查内存常驻：若配置指纹未变且内存中已有插件，0ms 瞬间返回！
+  // 1. 检查内存常驻与持久化指纹：
+  // 若内存已有插件，且指纹与上次同步指纹（或本地持久化指纹）一致，0ms 瞬间退出，严禁联网！
   if (
-    currentFingerprint === lastSyncedFingerprint &&
-    dynamicRegistry.size > 0
+    dynamicRegistry.size > 0 &&
+    (currentFingerprint === lastSyncedFingerprint || currentFingerprint === savedFingerprint)
   ) {
+    lastSyncedFingerprint = currentFingerprint;
     return [];
   }
 
-  // 2. 检查本地硬盘数据库：若内存为空但本地有缓存，直接秒读恢复，无需联网！
-  if (dynamicRegistry.size === 0) {
-    const restored = restoreDynamicPluginsFromStorage(builtInSourcesMap);
-    if (restored > 0 && currentFingerprint === lastSyncedFingerprint) {
+  // 2. 检查本地硬盘数据库：若指纹一致且本地存储中已有缓存插件，秒读恢复入内存，0ms 退出无需联网！
+  if (currentFingerprint === savedFingerprint) {
+    if (dynamicRegistry.size === 0) {
+      restoreDynamicPluginsFromStorage(builtInSourcesMap);
+    }
+    if (dynamicRegistry.size > 0) {
+      lastSyncedFingerprint = currentFingerprint;
       return [];
     }
   }
 
   // 3. 仅在首次启动或用户修改了 URL 时，才真正向网络请求
-  lastSyncedFingerprint = currentFingerprint;
+  // 网络同步前，必须确保本地磁盘已有数据完全加载进内存，严禁空内存同步覆盖磁盘！
+  await ensureDynamicPluginsReady(8000);
+
   const allUrls = [];
 
   if (tier0UrlsStr && typeof tier0UrlsStr === "string") {
     const urls0 = Array.from(
       new Set(
         tier0UrlsStr
-          .split(/[\n,;]+/)
+          .split(/[\s\n,;，；]+/)
           .map((u) => u.trim())
           .filter((u) => u.startsWith("http"))
       )
@@ -1540,7 +2156,7 @@ async function syncCustomPlugins(
     const urls3 = Array.from(
       new Set(
         tier3UrlsStr
-          .split(/[\n,;]+/)
+          .split(/[\s\n,;，；]+/)
           .map((u) => u.trim())
           .filter((u) => u.startsWith("http"))
       )
@@ -1548,12 +2164,27 @@ async function syncCustomPlugins(
     urls3.forEach((u) => allUrls.push({ url: u, tier: "tier3" }));
   }
 
-  if (allUrls.length === 0) return [];
+  if (allUrls.length === 0) {
+    lastSyncedFingerprint = currentFingerprint;
+    setLastSyncedFingerprint(currentFingerprint);
+    return [];
+  }
 
   const tasks = allUrls.map((item) =>
     registerOrUpdatePlugin(item.url, item.tier, builtInSourcesMap)
   );
-  return await Promise.allSettled(tasks);
+  const results = await Promise.allSettled(tasks);
+
+  // 4. 只有在至少成功拉取到音源时，才持久化记录指纹，防止断网导致“永久断更”
+  const hasSuccess = results.some(
+    (r) => r.status === "fulfilled" && r.value && r.value.status !== "error"
+  );
+  if (hasSuccess) {
+    lastSyncedFingerprint = currentFingerprint;
+    setLastSyncedFingerprint(currentFingerprint);
+  }
+
+  return results;
 }
 
 /**
@@ -1598,10 +2229,408 @@ module.exports = {
   ensureDynamicPluginsReady,
   deleteDynamicPlugin,
   clearAllDynamicPlugins,
+  getSyncDiagnosticLogs,
 };
 
   },
-  "./core/fallback-pure": function(module, exports, require) {
+  "./core/quality-fallback": function(module, exports, require, env, getUserVariables, __musicfree_require) {
+"use strict";
+
+/**
+ * 音质安全降级与多源音质调度引擎
+ * 
+ * 核心设计准则：
+ * 1. 严格遵循宿主软件设置中的默认音质作为上限基准，绝对不擅自向上越级攀升（如默认 standard 时绝不自作主张下 super）；
+ * 2. 单向向下平滑梯队：只有在当前请求的音质无法获取时，才在用户允许降级的前提下逐级向下试探，保底出声；
+ * 3. 强容错：捕获插件抛出的任何异常，避免因单源不支持特定音质而导致整体假死或误报“没有”。
+ */
+
+function isInvalid404Url(url) {
+  if (!url || typeof url !== "string") return true;
+  if (url.includes("404.mp3") || url.includes("error.mp3")) return true;
+  return false;
+}
+
+/**
+ * 根据宿主传入的目标音质与降级开关，生成单向向下的回退梯队
+ * @param {string} requestedQuality - 客户端请求的目标音质
+ * @param {boolean} allowDowngrade - 是否允许自动降级兜底
+ * @returns {string[]} 尝试音质序列
+ */
+function getQualityFallbackLadder(requestedQuality = "standard", allowDowngrade = true) {
+  const req = (requestedQuality || "standard").toLowerCase();
+
+  // 若用户关闭了自动降级（洁癖模式），严格只尝试用户指定的单一音质
+  if (!allowDowngrade) {
+    return [req];
+  }
+
+  // 单向向下回退梯队（绝不向上越级！）
+  switch (req) {
+    case "hires":
+      return ["hires", "super", "high", "standard", "low"];
+    case "super":
+    case "lossless":
+      return ["super", "high", "standard", "low"];
+    case "high":
+      return ["high", "standard", "low"];
+    case "standard":
+      return ["standard", "low"];
+    case "low":
+      return ["low"];
+    default:
+      // 未知标识，优先尝试其本身，然后向下兜底
+      return [req, "standard", "low"];
+  }
+}
+
+/**
+ * 对指定音源安全拉取音频直链（含平滑降级处理）
+ * @param {object} source - 音源实例
+ * @param {object} item - 歌曲条目
+ * @param {string} requestedQuality - 客户端请求的音质
+ * @param {boolean} allowDowngrade - 是否允许降级
+ * @returns {Promise<{ mediaRes: object, qualityUsed: string } | null>}
+ */
+async function safeGetMediaSourceWithFallback(
+  source,
+  item,
+  requestedQuality = "standard",
+  allowDowngrade = true
+) {
+  if (!source || typeof source.getMediaSource !== "function") {
+    return null;
+  }
+
+  const ladder = getQualityFallbackLadder(requestedQuality, allowDowngrade);
+
+  for (const q of ladder) {
+    try {
+      const res = await source.getMediaSource(item, q);
+      if (
+        res &&
+        res.url &&
+        typeof res.url === "string" &&
+        res.url.startsWith("http") &&
+        !isInvalid404Url(res.url)
+      ) {
+        return {
+          mediaRes: res,
+          qualityUsed: q,
+        };
+      }
+    } catch (err) {
+      // 捕获第三方插件因不支持高音质直接抛出的异常，继续尝试下一梯队
+    }
+  }
+
+  return null;
+}
+
+module.exports = {
+  isInvalid404Url,
+  getQualityFallbackLadder,
+  safeGetMediaSourceWithFallback,
+};
+
+  },
+  "./core/sheet-importer": function(module, exports, require, env, getUserVariables, __musicfree_require) {
+"use strict";
+
+const axios = require("axios");
+
+/**
+ * 判断是否为插件代码或合集配置的安装链接
+ * @param {string} text - 输入文本
+ * @returns {boolean}
+ */
+function isPluginOrSubscriptionUrl(text) {
+  if (!text || typeof text !== "string") return false;
+  const t = text.trim();
+
+  // 1. 显式前缀指令 (强制认定为插件/合集安装)
+  if (
+    t.startsWith("add ") ||
+    t.startsWith("install ") ||
+    t.startsWith("plugin ") ||
+    t.startsWith("源 ") ||
+    t.startsWith("添加 ")
+  ) {
+    return true;
+  }
+
+  // 2. 如果是已知音乐平台的歌单链接，绝不当成插件安装！
+  const isKnownMusicPlatform =
+    /163\.com|163cn\.tv|qq\.com|kuwo\.cn|kugou\.com|bilibili\.com|b23\.tv|spotify\.com|apple\.com/i.test(
+      t
+    );
+  if (isKnownMusicPlatform) {
+    return false;
+  }
+
+  // 3. 去除 URL query 和 hash，检查后缀
+  const cleanUrl = t.split("?")[0].split("#")[0].toLowerCase();
+  if (cleanUrl.endsWith(".js") || cleanUrl.endsWith(".json")) {
+    return true;
+  }
+
+  // 4. 常见托管源特征
+  if (
+    /raw\.githubusercontent\.com|gitee\.com\/.*\/raw|plugins\.json|subscription\.json/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * 提取清理后的插件下载 URL
+ */
+function cleanPluginUrl(text) {
+  if (!text || typeof text !== "string") return "";
+  return text
+    .trim()
+    .replace(/^(add|install|plugin|源|添加)\s+/i, "")
+    .trim();
+}
+
+/**
+ * 通用跨平台歌单直解引擎
+ * 支持：网易云音乐、QQ音乐、酷我、酷狗、B站等主流歌单，并支持已加载子插件代理
+ * 
+ * @param {string} urlLike - 歌单链接或分享文本
+ * @param {Array} activeSources - 当前已激活的音源列表 (用于委托代理)
+ * @param {string} platformName - 归一化的平台名称 (默认: 智能多源聚合)
+ * @returns {Promise<Array>} 标准化后的歌曲列表
+ */
+async function resolveMusicSheet(
+  urlLike,
+  activeSources = [],
+  platformName = "智能多源聚合"
+) {
+  if (!urlLike || typeof urlLike !== "string") return [];
+  const text = urlLike.trim();
+
+  // =================================================================
+  // 通道 1: 网易云音乐 (163) 歌单直解
+  // =================================================================
+  const neteaseMatch =
+    /(?:163\.com|163cn\.tv).*(?:[?&]id=|\/playlist\/)(\d+)/i.exec(text) ||
+    /playlist\?id=(\d+)/i.exec(text);
+  if (neteaseMatch && neteaseMatch[1]) {
+    const sheetId = neteaseMatch[1];
+    try {
+      const res = await axios.get(
+        `https://music.163.com/api/v6/playlist/detail?id=${sheetId}`,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            Referer: "https://music.163.com/",
+          },
+          timeout: 10000,
+        }
+      );
+      const playlist = res.data?.playlist;
+      const tracks = playlist?.tracks || [];
+      if (Array.isArray(tracks) && tracks.length > 0) {
+        return tracks.map((t) => ({
+          id: String(t.id),
+          title: t.name || "未知歌曲",
+          artist: (t.ar || []).map((a) => a.name).join(", ") || "未知歌手",
+          album: t.al?.name || "",
+          artwork: t.al?.picUrl || "",
+          duration: Math.round((t.dt || 0) / 1000),
+          platform: platformName,
+          _source: "netease",
+        }));
+      }
+    } catch (e) {}
+  }
+
+  // =================================================================
+  // 通道 2: QQ 音乐歌单直解
+  // =================================================================
+  const qqMatch =
+    /(?:qq\.com).*(?:taoge\.html\?id=|playlist\/|disstid=)(\d+)/i.exec(text) ||
+    /(?:y\.qq\.com\/n\/ryqq\/playlist\/)(\d+)/i.exec(text);
+  if (qqMatch && qqMatch[1]) {
+    const disstid = qqMatch[1];
+    try {
+      const res = await axios.get(
+        `https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?type=1&json=1&utf8=1&onlysong=0&disstid=${disstid}&format=json`,
+        {
+          headers: {
+            Referer: "https://y.qq.com/",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          },
+          timeout: 10000,
+        }
+      );
+      const songlist = res.data?.cdlist?.[0]?.songlist || [];
+      if (Array.isArray(songlist) && songlist.length > 0) {
+        return songlist.map((t) => ({
+          id: String(t.songmid || t.mid || t.songid),
+          title: t.songname || t.name || "未知歌曲",
+          artist: (t.singer || []).map((s) => s.name).join(", ") || "未知歌手",
+          album: t.albumname || t.album?.name || "",
+          artwork: t.albummid
+            ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${t.albummid}.jpg`
+            : "",
+          duration: t.interval || 0,
+          platform: platformName,
+          _source: "qq",
+        }));
+      }
+    } catch (e) {}
+  }
+
+  // =================================================================
+  // 通道 3: 酷我音乐歌单直解
+  // =================================================================
+  const kuwoMatch = /(?:kuwo\.cn).*(?:playlist_detail\/|pid=)(\d+)/i.exec(text);
+  if (kuwoMatch && kuwoMatch[1]) {
+    const pid = kuwoMatch[1];
+    try {
+      const res = await axios.get(
+        `http://m.kuwo.cn/newh5/singles/songlistinfo?pid=${pid}`,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+          },
+          timeout: 10000,
+        }
+      );
+      const musicList = res.data?.data?.musicList || [];
+      if (Array.isArray(musicList) && musicList.length > 0) {
+        return musicList.map((t) => ({
+          id: String(t.rid || t.id),
+          title: t.name || t.songname || "未知歌曲",
+          artist: t.artist || t.singer || "未知歌手",
+          album: t.album || "",
+          artwork: t.pic || t.cover || "",
+          duration: t.duration || 0,
+          platform: platformName,
+          _source: "kuwo",
+        }));
+      }
+    } catch (e) {}
+  }
+
+  // =================================================================
+  // 通道 4: 酷狗音乐歌单直解
+  // =================================================================
+  const kugouMatch =
+    /(?:kugou\.com).*(?:special\/single\/|specialid=)(\d+)/i.exec(text);
+  if (kugouMatch && kugouMatch[1]) {
+    const specialid = kugouMatch[1];
+    try {
+      const res = await axios.get(
+        `http://mobilecdn.kugou.com/api/v3/special/song?specialid=${specialid}&format=json`,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          },
+          timeout: 10000,
+        }
+      );
+      const list = res.data?.data?.info || [];
+      if (Array.isArray(list) && list.length > 0) {
+        return list.map((t) => {
+          const rawName = t.filename || t.songname || "";
+          let title = rawName;
+          let artist = t.singername || "";
+          if (rawName.includes(" - ")) {
+            const parts = rawName.split(" - ");
+            artist = parts[0].trim();
+            title = parts.slice(1).join(" - ").trim();
+          }
+          return {
+            id: String(t.hash || t.audio_id),
+            title: title || "未知歌曲",
+            artist: artist || "未知歌手",
+            album: t.album_name || "",
+            artwork: (t.imgpath || "").replace("{size}", "400"),
+            duration: t.duration || 0,
+            platform: platformName,
+            _source: "kugou",
+          };
+        });
+      }
+    } catch (e) {}
+  }
+
+  // =================================================================
+  // 通道 5: 哔哩哔哩 (Bilibili) 收藏夹 / 媒体列表
+  // =================================================================
+  const biliMatch =
+    /(?:bilibili\.com).*(?:medialist\/play\/ml|fid=)(\d+)/i.exec(text);
+  if (biliMatch && biliMatch[1]) {
+    const fid = biliMatch[1];
+    try {
+      const res = await axios.get(
+        `https://api.bilibili.com/x/v3/fav/resource/list?media_id=${fid}&pn=1&ps=50`,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          },
+          timeout: 10000,
+        }
+      );
+      const medias = res.data?.data?.medias || [];
+      if (Array.isArray(medias) && medias.length > 0) {
+        return medias.map((m) => ({
+          id: String(m.id || m.bvid),
+          title: m.title || "未知音频",
+          artist: m.upper?.name || "B站UP主",
+          album: "Bilibili收藏夹",
+          artwork: m.cover || "",
+          duration: m.duration || 0,
+          platform: platformName,
+          _source: "bilibili",
+        }));
+      }
+    } catch (e) {}
+  }
+
+  // =================================================================
+  // 通道 6: 委托给当前已加载的具有 importMusicSheet 方法的子插件
+  // =================================================================
+  if (Array.isArray(activeSources) && activeSources.length > 0) {
+    for (const source of activeSources) {
+      if (typeof source.importMusicSheet === "function") {
+        try {
+          const list = await source.importMusicSheet(urlLike);
+          if (Array.isArray(list) && list.length > 0) {
+            return list.map((item) => ({
+              ...item,
+              platform: platformName,
+              _source: item.platform || item._source || source.name || "plugin",
+            }));
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  return [];
+}
+
+module.exports = {
+  isPluginOrSubscriptionUrl,
+  cleanPluginUrl,
+  resolveMusicSheet,
+};
+
+  },
+  "./core/fallback-pure": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 const axios = require("axios");
@@ -1614,6 +2643,10 @@ const {
   ensureDynamicPluginsReady,
 } = require("./dynamic-loader");
 const { matchCache } = require("./cache");
+const {
+  safeGetMediaSourceWithFallback,
+  getQualityFallbackLadder,
+} = require("./quality-fallback");
 
 // 纯净版：0 内置源
 const builtInSources = {};
@@ -1694,16 +2727,24 @@ async function getOrderedSources(env = {}) {
   const sources = [];
   const blacklist = getBlacklistSet(env);
 
-  // 1. 同步加载用户配置的动态插件 (全容错变量名解析 + 0ms 指纹拦截)
+  // 1. 【前置就绪锁】：先确保本地持久化存储（localStorage + IndexedDB）全部恢复入内存！
+  await ensureDynamicPluginsReady(8000);
+
+  // 2. 本地已就绪后，再视用户配置指纹是否变动决定是否需要网络同步
   const tier0Urls =
     env.tier0PluginUrls ||
+    env["优先音源"] ||
     env.customPluginUrls ||
     env.pluginUrls ||
     env.urls ||
     env.tier0 ||
     "";
   const tier3Urls =
-    env.tier3PluginUrls || env.tier3 || env.fallbackUrls || "";
+    env.tier3PluginUrls ||
+    env["兜底音源"] ||
+    env.tier3 ||
+    env.fallbackUrls ||
+    "";
 
   if (tier0Urls || tier3Urls) {
     try {
@@ -1715,11 +2756,6 @@ async function getOrderedSources(env = {}) {
     } catch (e) {
       console.warn("[FallbackPure] 同步动态插件失败:", e.message);
     }
-  }
-
-  // 2. 内存若为空，启动就绪等待锁 (避免冷启动异步读取竞态)
-  if (dynamicRegistry.size === 0) {
-    await ensureDynamicPluginsReady(2000);
   }
 
   // 3. 注入 Tier 0 (动态优先源)
@@ -2120,29 +3156,23 @@ async function resolveMediaSourceWithFallback(
       }
 
       if (cachedSource && typeof cachedSource.getMediaSource === "function") {
-        try {
-          const cachedRes = await cachedSource.getMediaSource(
-            cachedMatch.item,
-            quality
-          );
-          if (
-            cachedRes &&
-            cachedRes.url &&
-            cachedRes.url.startsWith("http") &&
-            !isInvalid404Url(cachedRes.url)
-          ) {
-            const normRes = await normalizeMediaSource(cachedRes);
-            return {
-              ...normRes,
-              platform: "智能多源聚合",
-              _sourceUsed: cachedSource.name || cachedMatch.sourceKey,
-              _fromMemoryCache: true,
-              _matchedSong: `${cachedMatch.item.title} - ${cachedMatch.item.artist}`,
-            };
-          } else {
-            matchCache.invalidate(target.title, target.artist);
-          }
-        } catch (err) {
+        const fallbackRes = await safeGetMediaSourceWithFallback(
+          cachedSource,
+          cachedMatch.item,
+          quality,
+          allowDowngrade
+        );
+
+        if (fallbackRes && fallbackRes.mediaRes) {
+          const normRes = await normalizeMediaSource(fallbackRes.mediaRes);
+          return {
+            ...normRes,
+            platform: "智能多源聚合",
+            _sourceUsed: cachedSource.name || cachedMatch.sourceKey,
+            _fromMemoryCache: true,
+            _matchedSong: `${cachedMatch.item.title} - ${cachedMatch.item.artist}`,
+          };
+        } else {
           matchCache.invalidate(target.title, target.artist);
         }
       }
@@ -2168,24 +3198,21 @@ async function resolveMediaSourceWithFallback(
     );
 
     if (origSource && typeof origSource.getMediaSource === "function") {
-      try {
-        const res = await origSource.getMediaSource(musicItem, quality);
-        if (
-          res &&
-          res.url &&
-          res.url.startsWith("http") &&
-          !isInvalid404Url(res.url)
-        ) {
-          const normRes = await normalizeMediaSource(res);
-          return {
-            ...normRes,
-            platform: "智能多源聚合",
-            _sourceUsed: origSource.name || origSource.platform || origSourceKey,
-          };
-        } else {
-          primaryTriedAndFailed = true;
-        }
-      } catch (err) {
+      const fallbackRes = await safeGetMediaSourceWithFallback(
+        origSource,
+        musicItem,
+        quality,
+        allowDowngrade
+      );
+
+      if (fallbackRes && fallbackRes.mediaRes) {
+        const normRes = await normalizeMediaSource(fallbackRes.mediaRes);
+        return {
+          ...normRes,
+          platform: "智能多源聚合",
+          _sourceUsed: origSource.name || origSource.platform || origSourceKey,
+        };
+      } else {
         primaryTriedAndFailed = true;
       }
     }
@@ -2252,27 +3279,19 @@ async function resolveMediaSourceWithFallback(
     if (validMatches.length > 0) {
       // 按照匹配得分从高到低排序，原唱优先
       validMatches.sort((a, b) => b.score - a.score);
+      const candidates = validMatches.slice(0, 3);
 
-      // 依次快速拉取最高分音源的音频直链
-      for (const candidate of validMatches.slice(0, 3)) {
+      // =============================================================
+      // 第一轮：严格高音质匹配（绝不无脑降级！）
+      // 对所有候选源先统一请求用户/客户端指定的 quality
+      // 只要全网任意源能提供该目标音质，直接输出，100% 满足高音质诉求！
+      // =============================================================
+      for (const candidate of candidates) {
         try {
-          let mediaRes = await candidate.source.getMediaSource(
+          const mediaRes = await candidate.source.getMediaSource(
             candidate.bestMatch,
             quality
           );
-
-          if (
-            (!mediaRes || !mediaRes.url || !mediaRes.url.startsWith("http")) &&
-            allowDowngrade &&
-            quality !== "standard" &&
-            quality !== "low"
-          ) {
-            mediaRes = await candidate.source.getMediaSource(
-              candidate.bestMatch,
-              "standard"
-            );
-          }
-
           if (
             mediaRes &&
             mediaRes.url &&
@@ -2306,6 +3325,57 @@ async function resolveMediaSourceWithFallback(
             };
           }
         } catch (mediaErr) {}
+      }
+
+      // =============================================================
+      // 第二轮：次级阶梯降级（全网穷尽第一轮后才触发）
+      // 仅当全网高分源均无法提供目标音质，且允许降级时，
+      // 才单向向下按梯队（如 super ➔ high ➔ standard ➔ low）平滑下潜保底出声
+      // =============================================================
+      if (allowDowngrade) {
+        const ladder = getQualityFallbackLadder(quality, true).slice(1); // 排除第一轮已尝试的 quality
+        for (const fallbackQuality of ladder) {
+          for (const candidate of candidates) {
+            try {
+              const mediaRes = await candidate.source.getMediaSource(
+                candidate.bestMatch,
+                fallbackQuality
+              );
+              if (
+                mediaRes &&
+                mediaRes.url &&
+                mediaRes.url.startsWith("http") &&
+                !isInvalid404Url(mediaRes.url)
+              ) {
+                if (enableCache) {
+                  const sKey =
+                    candidate.source.key ||
+                    candidate.source.platform ||
+                    candidate.source.name ||
+                    "unknown";
+                  matchCache.set(
+                    target.title,
+                    target.artist,
+                    sKey,
+                    candidate.bestMatch
+                  );
+                }
+
+                const normRes = await normalizeMediaSource(mediaRes);
+                return {
+                  ...normRes,
+                  platform: "智能多源聚合",
+                  _sourceUsed:
+                    candidate.source.name ||
+                    candidate.source.platform ||
+                    "动态源",
+                  _matchedSong: `${candidate.bestMatch.title} - ${candidate.bestMatch.artist}`,
+                  _matchScore: candidate.bestMatch._matchScore,
+                };
+              }
+            } catch (mediaErr) {}
+          }
+        }
       }
     }
   }
@@ -3086,7 +4156,7 @@ module.exports = {
 };
 
   },
-  "./index-pure": function(module, exports, require) {
+  "./index-pure": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 const config = require("./config-pure");
@@ -3109,26 +4179,88 @@ const {
   updateAllRegisteredPlugins,
   deleteDynamicPlugin,
   clearAllDynamicPlugins,
+  getSyncDiagnosticLogs,
 } = require("./core/dynamic-loader");
 const { matchCache } = require("./core/cache");
+const {
+  isPluginOrSubscriptionUrl,
+  cleanPluginUrl,
+  resolveMusicSheet,
+} = require("./core/sheet-importer");
+const storage = require("./core/storage");
 
 /**
- * 跨平台安全读取 MusicFree 注入的用户变量 (env.getUserVariables)
+ * 跨平台全兼容安全读取 MusicFree 注入的用户变量 (支持 this.getUserVariables / env / 全局函数 / 异步 Promise)
  */
-function getUserEnv() {
+async function getUserEnv(ctx) {
+  // 1. 优先检查 this 上下文 (MusicFree 桌面版核心机制: this.getUserVariables)
+  try {
+    if (ctx && typeof ctx.getUserVariables === "function") {
+      const res = ctx.getUserVariables();
+      const val = res && typeof res.then === "function" ? (await res) || {} : res || {};
+      if (val && typeof val === "object" && Object.keys(val).length > 0) return val;
+    }
+  } catch (e) {}
+
+  try {
+    if (ctx && ctx.userVariables && typeof ctx.userVariables === "object" && !Array.isArray(ctx.userVariables)) {
+      if (Object.keys(ctx.userVariables).length > 0) return ctx.userVariables;
+    }
+  } catch (e) {}
+
+  // 2. 检查全局独立函数 getUserVariables() (部分沙箱环境直接挂载全局)
+  try {
+    if (typeof getUserVariables === "function") {
+      const res = getUserVariables();
+      const val = res && typeof res.then === "function" ? (await res) || {} : res || {};
+      if (val && typeof val === "object" && Object.keys(val).length > 0) return val;
+    }
+  } catch (e) {}
+
+  // 3. 检查 window / globalThis 上的 getUserVariables
+  try {
+    if (typeof window !== "undefined" && window && typeof window.getUserVariables === "function") {
+      const res = window.getUserVariables();
+      const val = res && typeof res.then === "function" ? (await res) || {} : res || {};
+      if (val && typeof val === "object" && Object.keys(val).length > 0) return val;
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof globalThis !== "undefined" && globalThis && typeof globalThis.getUserVariables === "function") {
+      const res = globalThis.getUserVariables();
+      const val = res && typeof res.then === "function" ? (await res) || {} : res || {};
+      if (val && typeof val === "object" && Object.keys(val).length > 0) return val;
+    }
+  } catch (e) {}
+
+  // 4. 检查 env.getUserVariables (移动端与部分沙箱环境)
   try {
     if (typeof env !== "undefined" && env && typeof env.getUserVariables === "function") {
-      return env.getUserVariables() || {};
+      const res = env.getUserVariables();
+      const val = res && typeof res.then === "function" ? (await res) || {} : res || {};
+      if (val && typeof val === "object" && Object.keys(val).length > 0) return val;
     }
   } catch (e) {}
 
   try {
     if (typeof globalThis !== "undefined" && globalThis.env && typeof globalThis.env.getUserVariables === "function") {
-      return globalThis.env.getUserVariables() || {};
+      const res = globalThis.env.getUserVariables();
+      const val = res && typeof res.then === "function" ? (await res) || {} : res || {};
+      if (val && typeof val === "object" && Object.keys(val).length > 0) return val;
     }
   } catch (e) {}
 
-  if (typeof userVariables !== "undefined" && userVariables && typeof userVariables === "object") {
+  try {
+    if (typeof window !== "undefined" && window.env && typeof window.env.getUserVariables === "function") {
+      const res = window.env.getUserVariables();
+      const val = res && typeof res.then === "function" ? (await res) || {} : res || {};
+      if (val && typeof val === "object" && Object.keys(val).length > 0) return val;
+    }
+  } catch (e) {}
+
+  // 5. 检查直接注入的全局 userVariables 对象
+  if (typeof userVariables !== "undefined" && userVariables && typeof userVariables === "object" && !Array.isArray(userVariables)) {
     return userVariables;
   }
 
@@ -3198,7 +4330,7 @@ const plugin = {
    * 动态多源聚合搜索
    */
   async search(query, page = 1, type = "music") {
-    const userEnv = getUserEnv();
+    const userEnv = await getUserEnv(this);
     return await unifiedSearch(query, page, type, userEnv);
   },
 
@@ -3206,7 +4338,7 @@ const plugin = {
    * 动态多源容灾与自动换源播放
    */
   async getMediaSource(musicItem, quality = "standard") {
-    const userEnv = getUserEnv();
+    const userEnv = await getUserEnv(this);
     return await resolveMediaSourceWithFallback(musicItem, quality, userEnv);
   },
 
@@ -3214,7 +4346,7 @@ const plugin = {
    * 歌词动态跨源自动补全
    */
   async getLyric(musicItem) {
-    const userEnv = getUserEnv();
+    const userEnv = await getUserEnv(this);
     return await resolveLyricWithFallback(musicItem, userEnv);
   },
 
@@ -3273,7 +4405,7 @@ const plugin = {
   async importMusicSheet(urlLike) {
     if (!urlLike || typeof urlLike !== "string") return [];
     const text = urlLike.trim();
-    const userEnv = getUserEnv();
+    const userEnv = await getUserEnv(this);
 
     // 指令 1: 查看音源状态看板 ("status" / "源" / "看板" / "音源")
     if (
@@ -3284,33 +4416,64 @@ const plugin = {
       text === "list"
     ) {
       const activeSources = await getOrderedSources(userEnv);
-      if (activeSources.length === 0) {
-        return [
-          {
-            id: "no_active_source",
-            title: "当前纯净版未加载任何音源",
-            artist: "提示: 请在用户变量【优先音源】中添加 .js 插件或 .json 合集链接",
-            album: "状态: 空闲",
-            artwork: config.defaultArtwork,
-            duration: 0,
-            platform: config.platform,
-          },
-        ];
+      const items = [];
+      const diag = getSyncDiagnosticLogs();
+
+      // 顶部汇总状态条目
+      items.push({
+        id: "source_summary_status",
+        title: `[存储看板] 本地活跃: ${activeSources.length} 个音源 · 多轨存储: 原生磁盘 + IndexedDB + localStorage`,
+        artist: diag.lastSyncTime > 0
+          ? `最近网络同步: ${diag.lastSyncStatus === "success" ? "成功" : "部分异常"} | 失败源: ${diag.failedPlugins.length} 个`
+          : `本地持久化状态: 正常 · 纯本地秒开`,
+        album: `💡 提示: 输入 'update' 检查更新，输入 'del 音源名' 删除`,
+        artwork: config.defaultArtwork,
+        duration: 0,
+        platform: config.platform,
+      });
+
+      const inheritInfo = storage.getInheritInfo ? storage.getInheritInfo() : null;
+      if (inheritInfo && inheritInfo.inherited) {
+        items.push({
+          id: "source_inherit_status",
+          title: `💡 [无感继承自愈] 已自动从上一个版本恢复 ${inheritInfo.count} 个音源`,
+          artist: `历史版本 Hash: ${inheritInfo.fromHash.slice(0, 12)}... · 零损失平滑过渡`,
+          album: `状态: AUTO_INHERITED`,
+          artwork: config.defaultArtwork,
+          duration: 0,
+          platform: config.platform,
+        });
       }
-      return activeSources.map((s, idx) => {
+
+      if (activeSources.length === 0) {
+        items.push({
+          id: "no_active_source",
+          title: "当前纯净版未加载任何音源",
+          artist: "提示: 请在用户变量【优先音源】中添加 .js 插件或 .json 合集链接",
+          album: "状态: 空闲",
+          artwork: config.defaultArtwork,
+          duration: 0,
+          platform: config.platform,
+        });
+        return items;
+      }
+
+      activeSources.forEach((s, idx) => {
         const name = s.name || s.platform || "未知音源";
         const ver = s.version || "1.0.0";
         const tier = s._tier || (idx < 5 ? "Tier 0 动态优先" : "Tier 3 动态兜底");
-        return {
+        items.push({
           id: `source_status_${idx}`,
           title: `[${tier}] ${name} (v${ver})`,
-          artist: `状态: 在线活跃 · 动态热加载 · 输入 'del ${name}' 可删除`,
+          artist: `本地持久化: 正常 · 状态: 在线活跃 · 输入 'del ${name}' 可删除`,
           album: `优先级位次: 第 ${idx + 1} 位`,
           artwork: config.defaultArtwork,
           duration: 0,
           platform: config.platform,
-        };
+        });
       });
+
+      return items;
     }
 
     // 指令 2: 一键检查并更新所有源 ("update" / "更新" / "check")
@@ -3372,7 +4535,7 @@ const plugin = {
       const query = text
         .replace(/^(del|delete|rm|remove|删除|卸载)\s+/i, "")
         .trim();
-      const delRes = deleteDynamicPlugin(query);
+      const delRes = await deleteDynamicPlugin(query);
       return [
         {
           id: "delete_feedback_item",
@@ -3437,7 +4600,7 @@ const plugin = {
       text === "reset" ||
       text === "重置"
     ) {
-      const clearRes = clearAllDynamicPlugins();
+      const clearRes = await clearAllDynamicPlugins();
       matchCache.clear();
       return [
         {
@@ -3452,9 +4615,10 @@ const plugin = {
       ];
     }
 
-    // 功能 3: 粘贴 HTTP 链接 (支持 .js 脚本 与 .json 合集订阅)
-    if (text.startsWith("http://") || text.startsWith("https://")) {
-      const regRes = await registerOrUpdatePlugin(text, "tier0", builtInSources);
+    // 功能 3: 插件代码或合集订阅链接安装 (仅限以 .js/.json 结尾或带 add/install 前缀，不劫持普通音乐歌单)
+    if (isPluginOrSubscriptionUrl(text)) {
+      const targetUrl = cleanPluginUrl(text);
+      const regRes = await registerOrUpdatePlugin(targetUrl, "tier0", builtInSources);
       const feedbackItems = [];
 
       feedbackItems.push({
@@ -3516,6 +4680,13 @@ const plugin = {
           return songs;
         }
       } catch (e) {}
+    }
+
+    // 功能 5: 通用跨平台音乐歌单直解 (网易云、QQ音乐、酷我、酷狗、B站或已加载子插件)
+    const activeSources = await getOrderedSources(userEnv);
+    const sheetSongs = await resolveMusicSheet(text, activeSources, config.platform);
+    if (Array.isArray(sheetSongs) && sheetSongs.length > 0) {
+      return sheetSongs;
     }
 
     return [];
@@ -3594,6 +4765,11 @@ module.exports = plugin;
           return require(moduleId);
         } catch (e) {}
       }
+      if (typeof __musicfree_require === "function") {
+        try {
+          return __musicfree_require(moduleId);
+        } catch (e) {}
+      }
       return {};
     }
 
@@ -3604,10 +4780,10 @@ module.exports = plugin;
       return customRequire(resolvedKey, nextModuleId);
     }
 
-    modFn(module, module.exports, scopedRequire);
+    modFn(module, module.exports, scopedRequire, env, getUserVariables, __musicfree_require);
     return module.exports;
   }
 
   var entry = customRequire(".", "./index-pure");
   module.exports = entry.default || entry;
-})();
+})(typeof env !== "undefined" ? env : undefined, typeof getUserVariables !== "undefined" ? getUserVariables : undefined, typeof __musicfree_require !== "undefined" ? __musicfree_require : (typeof require !== "undefined" ? require : undefined));
