@@ -1,7 +1,7 @@
 /**
  * MusicFree 智能多源聚合与自动容灾换源插件 (纯净版 - 0内置源)
  * 
- * 版本: 1.5.0-pure
+ * 版本: 1.6.0-pure
  * 作者: 夢酷 (mengkuikun)
  * 协议: MIT
  * 
@@ -59,13 +59,13 @@ module.exports = {
 
 const config = {
   platform: "智能多源聚合",
-  version: "1.5.0-pure",
+  version: "1.6.0-pure",
   author: "夢酷 (mengkuikun)",
   srcUrl: "https://raw.githubusercontent.com/mengkuikun/MusicFreePlusins/main/musicfree-auto-fallback-pure.js",
   description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
   cacheControl: "no-cache",
   defaultArtwork: "https://github.com/mengkuikun.png",
-  supportedSearchType: ["music", "album", "artist", "sheet"],
+  supportedSearchType: ["music", "album", "artist", "sheet", "lyric"],
   hints: {
     importMusicSheet: [
       "输入 status 查看活跃音源看板",
@@ -109,6 +109,78 @@ const config = {
       key: "enableMatchCache",
       name: "秒开记忆",
       hint: "记住可用音源实现 10ms 秒开与失效自愈（填 true 或 false，默认 true）",
+    },
+    {
+      key: "enableCrossComments",
+      name: "跨源热评",
+      hint: "音源无评论时自动拉取网易云/QQ热评（填 true 或 false，默认 true）",
+    },
+  ],
+};
+
+module.exports = config;
+
+  },
+  "./config": function(module, exports, require, env, getUserVariables, __musicfree_require) {
+"use strict";
+
+const config = {
+  platform: "智能多源聚合",
+  version: "1.6.0-pure",
+  author: "夢酷 (mengkuikun)",
+  srcUrl: "https://gitee.com/mengkuikun/music-free-plusins/raw/master/musicfree-auto-fallback-pure.js",
+  description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
+  cacheControl: "no-cache",
+  defaultArtwork: "https://github.com/mengkuikun.png",
+  supportedSearchType: ["music", "album", "artist", "sheet", "lyric"],
+  hints: {
+    importMusicSheet: [
+      "输入 status 查看活跃音源看板",
+      "输入 cache 查看换源秒开记忆看板",
+      "输入 clearcache 清空秒开记忆",
+      "输入 del <名称> 彻底删除指定音源",
+      "输入 update 一键体检并更新所有源",
+      "输入 clear 一键清空重置所有数据",
+    ],
+  },
+
+  defaultHeaders: {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    Accept: "*/*",
+  },
+
+  // 纯净版用户变量：0 内置源，全量依靠用户自定义动态插件或订阅合集
+  userVariables: [
+    {
+      key: "tier0PluginUrls",
+      name: "优先音源",
+      hint: "填入 .js 插件链接或 .json 插件合集链接（如: https://music.nairocy.com/plugins.json）",
+    },
+    {
+      key: "tier3PluginUrls",
+      name: "兜底音源",
+      hint: "填入仅在全网失效时触发兜底的备用 .js / .json 链接",
+    },
+    {
+      key: "tierBlacklist",
+      name: "屏蔽音源",
+      hint: "填入要禁用的源名称（如: webdav, 5sing，多个用逗号隔开）",
+    },
+    {
+      key: "autoQualityDowngrade",
+      name: "音质降级",
+      hint: "高音质或无损失效时自动向下兼容播放（填 true 或 false，默认 true）",
+    },
+    {
+      key: "enableMatchCache",
+      name: "秒开记忆",
+      hint: "记住可用音源实现 10ms 秒开与失效自愈（填 true 或 false，默认 true）",
+    },
+    {
+      key: "enableCrossComments",
+      name: "跨源热评",
+      hint: "音源无评论时自动拉取网易云/QQ热评（填 true 或 false，默认 true）",
     },
   ],
 };
@@ -2630,6 +2702,864 @@ module.exports = {
 };
 
   },
+  "./core/comment-resolver": function(module, exports, require, env, getUserVariables, __musicfree_require) {
+"use strict";
+
+const axios = require("axios");
+const { cleanTitle, cleanArtist } = require("./matcher");
+
+// LRU 缓存：记录歌曲到第三方平台歌曲ID的映射，加速后续分页请求 (容量 500)
+const songIdCache = new Map();
+const MAX_CACHE_SIZE = 500;
+
+function setCachedId(key, val) {
+  if (songIdCache.size >= MAX_CACHE_SIZE) {
+    const firstKey = songIdCache.keys().next().value;
+    songIdCache.delete(firstKey);
+  }
+  songIdCache.set(key, val);
+}
+
+function getCacheKey(title, artist) {
+  return `${(title || "").trim().toLowerCase()}:::${(artist || "").trim().toLowerCase()}`;
+}
+
+/**
+ * 获取网易云音乐公开评论区 (支持精彩热评置顶与平滑分页)
+ */
+async function getNeteaseComments(musicItem, page = 1) {
+  if (!musicItem) return { isEnd: true, data: [] };
+
+  let songId =
+    musicItem.neteaseId ||
+    (musicItem._source === "netease" && /^\d+$/.test(String(musicItem.id))
+      ? String(musicItem.id)
+      : null);
+
+  const cacheKey = getCacheKey(musicItem.title, musicItem.artist);
+  if (!songId && cacheKey !== ":::") {
+    const cached = songIdCache.get(`netease:${cacheKey}`);
+    if (cached) songId = cached;
+  }
+
+  // 若无可用 ID，根据 歌名 + 歌手 检索网易云歌曲 ID
+  if (!songId) {
+    const title = cleanTitle(musicItem.title || "");
+    const artist = cleanArtist(musicItem.artist || "");
+    const q = artist ? `${title} ${artist}` : title;
+    if (!q) return { isEnd: true, data: [] };
+
+    try {
+      const searchRes = await axios.get("https://music.163.com/api/cloudsearch/pc", {
+        params: { s: q, type: 1, limit: 3, offset: 0 },
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Referer: "https://music.163.com/",
+        },
+        timeout: 4500,
+      });
+
+      const firstSong = searchRes.data?.result?.songs?.[0];
+      if (firstSong && firstSong.id) {
+        songId = String(firstSong.id);
+        if (cacheKey !== ":::") {
+          setCachedId(`netease:${cacheKey}`, songId);
+        }
+      }
+    } catch (e) {}
+  }
+
+  if (!songId) {
+    return { isEnd: true, data: [] };
+  }
+
+  const pageSize = 20;
+  const offset = (Math.max(1, page) - 1) * pageSize;
+
+  try {
+    const res = await axios.get(
+      `https://music.163.com/api/v1/resource/comments/R_SO_4_${songId}`,
+      {
+        params: { limit: pageSize, offset },
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Referer: "https://music.163.com/",
+        },
+        timeout: 5000,
+      }
+    );
+
+    const data = res.data || {};
+    const commentsList = [];
+    const seenIds = new Set();
+
+    function formatNeteaseComment(c) {
+      if (!c || !c.commentId) return null;
+      const cid = String(c.commentId);
+      if (seenIds.has(cid)) return null;
+      seenIds.add(cid);
+
+      let replies;
+      if (Array.isArray(c.beReplied) && c.beReplied.length > 0) {
+        replies = c.beReplied
+          .filter((r) => r && r.content)
+          .map((r) => ({
+            id: String(r.beRepliedCommentId || ""),
+            nickName: r.user?.nickname || "回复",
+            avatar: r.user?.avatarUrl || "",
+            comment: r.content || "",
+          }));
+      }
+
+      return {
+        id: cid,
+        nickName: c.user?.nickname || "网易云音乐用户",
+        comment: c.content || "",
+        avatar: c.user?.avatarUrl || "",
+        like: typeof c.likedCount === "number" ? c.likedCount : 0,
+        createAt: c.time || 0,
+        location: c.ipLocation?.location || "",
+        replies: replies && replies.length > 0 ? replies : undefined,
+      };
+    }
+
+    // 第 1 页优先置顶精彩热评 (hotComments)
+    if (page === 1 && Array.isArray(data.hotComments) && data.hotComments.length > 0) {
+      for (const hc of data.hotComments) {
+        const item = formatNeteaseComment(hc);
+        if (item) commentsList.push(item);
+      }
+    }
+
+    // 添加常规评论 (comments)
+    if (Array.isArray(data.comments)) {
+      for (const c of data.comments) {
+        const item = formatNeteaseComment(c);
+        if (item) commentsList.push(item);
+      }
+    }
+
+    const isEnd =
+      data.more === false ||
+      !data.comments ||
+      data.comments.length === 0 ||
+      commentsList.length === 0;
+
+    return {
+      isEnd,
+      data: commentsList,
+    };
+  } catch (e) {
+    return { isEnd: true, data: [] };
+  }
+}
+
+/**
+ * 获取 QQ 音乐公开评论区 (支持点赞、头像与楼中楼回复)
+ */
+async function getQQComments(musicItem, page = 1) {
+  if (!musicItem) return { isEnd: true, data: [] };
+
+  let songId =
+    musicItem.songid ||
+    (musicItem._source === "qq" && /^\d+$/.test(String(musicItem.id))
+      ? String(musicItem.id)
+      : null);
+
+  const cacheKey = getCacheKey(musicItem.title, musicItem.artist);
+  if (!songId && cacheKey !== ":::") {
+    const cached = songIdCache.get(`qq:${cacheKey}`);
+    if (cached) songId = cached;
+  }
+
+  // 若无纯数字 ID，根据 歌名 + 歌手 检索 QQ 音乐歌曲数字 ID
+  if (!songId) {
+    const title = cleanTitle(musicItem.title || "");
+    const artist = cleanArtist(musicItem.artist || "");
+    const q = artist ? `${title} ${artist}` : title;
+    if (!q) return { isEnd: true, data: [] };
+
+    try {
+      const searchRes = await axios.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
+        params: { p: 1, n: 3, w: q, format: "json" },
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Referer: "https://y.qq.com/",
+        },
+        timeout: 4500,
+      });
+
+      const firstSong = searchRes.data?.data?.song?.list?.[0];
+      if (firstSong && firstSong.songid) {
+        songId = String(firstSong.songid);
+        if (cacheKey !== ":::") {
+          setCachedId(`qq:${cacheKey}`, songId);
+        }
+      }
+    } catch (e) {}
+  }
+
+  if (!songId) {
+    return { isEnd: true, data: [] };
+  }
+
+  const pageSize = 25;
+  const pageNum = Math.max(0, page - 1);
+
+  try {
+    const res = await axios.get(
+      "https://c.y.qq.com/base/fcgi-bin/fcg_global_comment_h5.fcg",
+      {
+        params: {
+          biztype: 1,
+          topid: songId,
+          cmd: 8,
+          pagenum: pageNum,
+          pagesize: pageSize,
+        },
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Referer: "https://y.qq.com/",
+        },
+        timeout: 5000,
+      }
+    );
+
+    const cmtData = res.data?.comment || {};
+    const commentListRaw = cmtData.commentlist || [];
+    const hotListRaw = (page === 1 && cmtData.hot_comment?.commentlist) || [];
+    const commentsList = [];
+    const seenIds = new Set();
+
+    function formatQQComment(c) {
+      if (!c || !c.commentid) return null;
+      const cid = String(c.commentid);
+      if (seenIds.has(cid)) return null;
+      seenIds.add(cid);
+
+      let replies;
+      if (Array.isArray(c.middlecommentcontent) && c.middlecommentcontent.length > 0) {
+        replies = c.middlecommentcontent
+          .filter((r) => r && (r.subcommentcontent || r.replycontent))
+          .map((r) => ({
+            id: String(r.subcommentid || ""),
+            nickName: r.replynick || "回复",
+            avatar: "",
+            comment: r.subcommentcontent || r.replycontent || "",
+          }));
+      }
+
+      return {
+        id: cid,
+        nickName: c.nick || "QQ音乐用户",
+        comment: c.rootcommentcontent || "",
+        avatar: c.avatarurl || "",
+        like: typeof c.praisenum === "number" ? c.praisenum : 0,
+        createAt: (c.time || 0) * 1000,
+        location: "",
+        replies: replies && replies.length > 0 ? replies : undefined,
+      };
+    }
+
+    // 第 1 页优先置顶 QQ 音乐热评
+    if (page === 1) {
+      for (const hc of hotListRaw) {
+        const item = formatQQComment(hc);
+        if (item) commentsList.push(item);
+      }
+    }
+
+    // 添加常规评论列表
+    for (const c of commentListRaw) {
+      const item = formatQQComment(c);
+      if (item) commentsList.push(item);
+    }
+
+    const isEnd =
+      cmtData.morecomment === 0 ||
+      commentListRaw.length === 0 ||
+      commentsList.length === 0;
+
+    return {
+      isEnd,
+      data: commentsList,
+    };
+  } catch (e) {
+    return { isEnd: true, data: [] };
+  }
+}
+
+/**
+ * 智能跨源歌曲评论调度与容灾核心
+ * 优先级:
+ * 1. 当前曲目关联音源 (若实现了 getMusicComments 则原汁原味透传)
+ * 2. 已激活的其他音源 (若实现了 getMusicComments)
+ * 3. 跨源热评容灾 (若用户开启 enableCrossComments，优先网易云热评，兜底 QQ 音乐)
+ */
+async function resolveMusicCommentsWithFallback(
+  musicItem,
+  page = 1,
+  env = {},
+  activeSources = []
+) {
+  if (!musicItem) return { isEnd: true, data: [] };
+
+  // 是否开启跨源热评兜底（默认 true，若用户在设置中填 false 则关闭）
+  const allowCrossFallback =
+    env.enableCrossComments !== "false" && env.enableCrossComments !== false;
+
+  // -------------------------------------------------------------
+  // Step 1: 原音源优先策略 (若当前歌曲有明确的 _source 且已加载)
+  // -------------------------------------------------------------
+  const sourceKey = (musicItem._source || "").toLowerCase();
+  if (sourceKey && Array.isArray(activeSources)) {
+    const origSource = activeSources.find(
+      (s) =>
+        (s.key && s.key.toLowerCase() === sourceKey) ||
+        (s.platform && s.platform.toLowerCase() === sourceKey) ||
+        (s.name && s.name.toLowerCase() === sourceKey)
+    );
+
+    if (origSource && typeof origSource.getMusicComments === "function") {
+      try {
+        const res = await origSource.getMusicComments(musicItem, page);
+        if (res && Array.isArray(res.data) && res.data.length > 0) {
+          return {
+            isEnd: !!res.isEnd,
+            data: res.data,
+          };
+        }
+      } catch (e) {}
+    }
+  }
+
+  // -------------------------------------------------------------
+  // Step 2: 轮询其他已注册的第三方音源插件 (若实现了 getMusicComments)
+  // -------------------------------------------------------------
+  if (Array.isArray(activeSources)) {
+    for (const source of activeSources) {
+      if (
+        typeof source.getMusicComments === "function" &&
+        source.key !== sourceKey
+      ) {
+        try {
+          const res = await source.getMusicComments(musicItem, page);
+          if (res && Array.isArray(res.data) && res.data.length > 0) {
+            return {
+              isEnd: !!res.isEnd,
+              data: res.data,
+            };
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  // -------------------------------------------------------------
+  // Step 3: 跨源公共热评兜底 (若开关开启)
+  // -------------------------------------------------------------
+  if (allowCrossFallback) {
+    // 3.1 优先拉取网易云热评
+    try {
+      const neteaseRes = await getNeteaseComments(musicItem, page);
+      if (neteaseRes && Array.isArray(neteaseRes.data) && neteaseRes.data.length > 0) {
+        return neteaseRes;
+      }
+    } catch (e) {}
+
+    // 3.2 兜底拉取 QQ 音乐评论
+    try {
+      const qqRes = await getQQComments(musicItem, page);
+      if (qqRes && Array.isArray(qqRes.data) && qqRes.data.length > 0) {
+        return qqRes;
+      }
+    } catch (e) {}
+  }
+
+  return { isEnd: true, data: [] };
+}
+
+module.exports = {
+  getNeteaseComments,
+  getQQComments,
+  resolveMusicCommentsWithFallback,
+};
+
+  },
+  "./core/lyric-searcher": function(module, exports, require, env, getUserVariables, __musicfree_require) {
+"use strict";
+
+const axios = require("axios");
+
+let config = {};
+try {
+  config = require("../config");
+} catch (e1) {
+  try {
+    config = require("./config-pure");
+  } catch (e2) {
+    try {
+      config = require("./config");
+    } catch (e3) {
+      config = {};
+    }
+  }
+}
+
+const defaultArtwork = config?.defaultArtwork || "https://github.com/mengkuikun.png";
+const platformName = config?.platform || "智能多源聚合";
+
+/**
+ * 网易云音乐歌词检索
+ */
+async function searchNetEaseLyrics(query, page = 1, pageSize = 10) {
+  try {
+    const res = await axios.get("https://music.163.com/api/search/get/web", {
+      params: {
+        s: query,
+        type: 1, // 歌曲搜索能精准定位正版音频及歌词
+        offset: (page - 1) * pageSize,
+        limit: pageSize,
+      },
+      headers: {
+        Referer: "https://music.163.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+      timeout: 4000,
+    });
+
+    const songs = res.data?.result?.songs || [];
+    const total = res.data?.result?.songCount || songs.length;
+
+    return {
+      isEnd: page * pageSize >= total,
+      data: songs.map((s) => ({
+        id: "lrc_netease_" + s.id,
+        _rawId: String(s.id),
+        title: s.name,
+        artist: (s.artists || []).map((a) => a.name).join(" / "),
+        album: (s.album?.name ? s.album.name + " · " : "") + "[网易云音乐]",
+        artwork: s.album?.picUrl || defaultArtwork,
+        _source: "netease",
+        platform: platformName,
+      })),
+    };
+  } catch (e) {
+    return { isEnd: true, data: [] };
+  }
+}
+
+/**
+ * QQ 音乐歌词检索 (通过 musicu.fcg 接口，含关键 comm 信令)
+ */
+async function searchQQLyrics(query, page = 1, pageSize = 10) {
+  const headers = {
+    referer: "https://y.qq.com",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/106.0.0.0 Safari/537.36",
+    Cookie: "uin=",
+  };
+
+  try {
+    const res = await axios.post(
+      "https://u.y.qq.com/cgi-bin/musicu.fcg",
+      {
+        comm: { ct: "19", cv: "1873", uin: "0" },
+        req_1: {
+          method: "DoSearchForQQMusicDesktop",
+          module: "music.search.SearchCgiService",
+          param: {
+            num_per_page: pageSize,
+            page_num: page,
+            query: query,
+            search_type: 0, // 0 为歌曲直达
+          },
+        },
+      },
+      { headers, timeout: 3000 }
+    );
+
+    const songData = res.data?.req_1?.data?.body?.song;
+    const list = songData?.list || res.data?.req_1?.data?.body?.item_song || [];
+    const total = songData?.totalnum || list.length;
+
+    return {
+      isEnd: page * pageSize >= total,
+      data: list.map((s) => ({
+        id: "lrc_qq_" + (s.mid || s.id),
+        _rawId: s.mid || String(s.id),
+        songmid: s.mid,
+        title: s.name || s.title,
+        artist: (s.singer || []).map((a) => a.name).join(" / "),
+        album: (s.album?.name ? s.album.name + " · " : "") + "[QQ音乐]",
+        artwork: s.album?.mid
+          ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.album.mid}.jpg`
+          : defaultArtwork,
+        _source: "qq",
+        platform: platformName,
+      })),
+    };
+  } catch (e) {
+    return { isEnd: true, data: [] };
+  }
+}
+
+/**
+ * 酷我音乐歌词检索 (支持内置源或独立 HTTP 双通道)
+ */
+async function searchKuwoLyrics(query, page = 1, pageSize = 10, kuwoSource) {
+  // 1. 如果内置源就绪，优先利用内置源
+  if (kuwoSource && typeof kuwoSource.search === "function") {
+    try {
+      const res = await kuwoSource.search(query, page, "music");
+      const list = res?.data || [];
+      if (list.length > 0) {
+        return {
+          isEnd: res?.isEnd ?? (page * pageSize >= list.length),
+          data: list.slice(0, pageSize).map((s) => ({
+            id: "lrc_kuwo_" + s.id,
+            _rawId: String(s.id),
+            title: s.title || s.name,
+            artist: s.artist,
+            album: (s.album ? s.album + " · " : "") + "[酷我音乐]",
+            artwork: s.artwork || defaultArtwork,
+            _source: "kuwo",
+            platform: platformName,
+          })),
+        };
+      }
+    } catch (e) {}
+  }
+
+  // 2. 独立轻量 HTTP 备选通道 (纯净版与脱机模式通用)
+  try {
+    const res = await axios.get("https://search.kuwo.cn/r.s", {
+      params: {
+        all: query,
+        ft: "music",
+        itemset: "web_2013",
+        client: "kt",
+        pn: (page - 1) * pageSize,
+        rn: pageSize,
+        rformat: "json",
+        encoding: "utf8",
+      },
+      headers: {
+        "User-Agent": "okhttp/3.10.0",
+      },
+      timeout: 4000,
+    });
+    const parsed = Function('"use strict"; return (' + res.data + ');')();
+    const list = parsed?.abslist || [];
+    const total = parseInt(parsed?.TOTAL) || list.length;
+    return {
+      isEnd: page * pageSize >= total,
+      data: list.map((s) => {
+        const cleanTitle = (s.SONGNAME || "").replace(/&nbsp;/g, " ");
+        const cleanArtist = (s.ARTIST || "").replace(/&nbsp;/g, " ");
+        const rawId = (s.MUSICRID || "").replace(/^MUSIC_/, "") || String(s.DC_TARGETID || "");
+        return {
+          id: "lrc_kuwo_" + rawId,
+          _rawId: rawId,
+          title: cleanTitle,
+          artist: cleanArtist,
+          album: (s.ALBUM ? s.ALBUM.replace(/&nbsp;/g, " ") + " · " : "") + "[酷我音乐]",
+          artwork: defaultArtwork,
+          _source: "kuwo",
+          platform: platformName,
+        };
+      }),
+    };
+  } catch (e) {
+    return { isEnd: true, data: [] };
+  }
+}
+
+/**
+ * 外部动态插件歌词检索
+ */
+async function searchDynamicPluginLyrics(plugin, query, page = 1, pageSize = 10) {
+  if (!plugin || typeof plugin.search !== "function") {
+    return [];
+  }
+
+  try {
+    const res = await Promise.race([
+      plugin.search(query, page, "lyric"),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 1500)),
+    ]);
+
+    if (res && Array.isArray(res.data)) {
+      const pluginName = plugin.name || plugin.platform || "外部源";
+      return res.data.slice(0, pageSize).map((item, idx) => ({
+        ...item,
+        id: `lrc_dyn_${plugin.key || pluginName}_${item.id || idx}`,
+        _rawId: String(item.id || idx),
+        title: item.title || item.name,
+        artist: item.artist || item.singer || "",
+        album: (item.album ? item.album + " · " : "") + `[${pluginName}]`,
+        artwork: item.artwork || item.cover || defaultArtwork,
+        _source: plugin.key || pluginName,
+        platform: platformName,
+      }));
+    }
+  } catch (e) {}
+
+  return [];
+}
+
+/**
+ * 全网多源聚合歌词搜索核心入口 (极速并发 + 异步预热)
+ */
+async function unifiedSearchLyric(query, page = 1, env = {}, builtInSources = {}, dynamicSources = []) {
+  if (!query || typeof query !== "string") {
+    return { isEnd: true, data: [] };
+  }
+
+  const cleanQ = query.trim();
+  const pageSize = 10;
+
+  const neteaseSource = builtInSources.netease;
+  const qqSource = builtInSources.qq;
+  const kuwoSource = builtInSources.kuwo;
+
+  const tasks = [
+    searchNetEaseLyrics(cleanQ, page, pageSize),
+    searchQQLyrics(cleanQ, page, pageSize),
+    searchKuwoLyrics(cleanQ, page, pageSize, kuwoSource),
+  ];
+
+  // 关键修复：仅筛选明确声明支持 lyric 检索的动态插件，严禁将带有播放 getLyric 的普通播放源当作歌词搜索引擎！
+  const lyricDynamicSources = (dynamicSources || []).filter(
+    (s) => s && Array.isArray(s.supportedSearchType) && s.supportedSearchType.includes("lyric")
+  );
+
+  lyricDynamicSources.forEach((ds) => {
+    tasks.push(
+      searchDynamicPluginLyrics(ds, cleanQ, page, pageSize).then((items) => ({
+        isEnd: true,
+        data: items,
+      }))
+    );
+  });
+
+  const settled = await Promise.allSettled(tasks);
+
+  const neResult = settled[0]?.status === "fulfilled" ? settled[0].value?.data || [] : [];
+  const qqResult = settled[1]?.status === "fulfilled" ? settled[1].value?.data || [] : [];
+  const kwResult = settled[2]?.status === "fulfilled" ? settled[2].value?.data || [] : [];
+  const dynResults = [];
+
+  for (let i = 3; i < settled.length; i++) {
+    if (settled[i]?.status === "fulfilled" && Array.isArray(settled[i].value?.data)) {
+      dynResults.push(...settled[i].value.data);
+    }
+  }
+
+  // 交叉交织 (Interleave) 聚合排序：确保各音源精品均能在前排展示
+  const combined = [];
+  const maxLen = Math.max(neResult.length, qqResult.length, kwResult.length, dynResults.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    if (neResult[i]) combined.push(neResult[i]);
+    if (qqResult[i]) combined.push(qqResult[i]);
+    if (kwResult[i]) combined.push(kwResult[i]);
+    if (dynResults[i]) combined.push(dynResults[i]);
+  }
+
+  // 首屏后台静默预拉取首项歌词 (fire-and-forget，绝不阻断列表立即返回)
+  if (page === 1 && combined.length > 0) {
+    const topNE = combined.find((it) => it._source === "netease");
+    if (topNE) {
+      directFetchNetEaseLyric(topNE._rawId).then((res) => {
+        if (res && res.rawLrc) {
+          topNE.rawLrc = res.rawLrc;
+          topNE.translation = res.translation || "";
+        }
+      }).catch(() => {});
+    }
+
+    const topQQ = combined.find((it) => it._source === "qq");
+    if (topQQ) {
+      directFetchQQLyric(topQQ.songmid || topQQ._rawId).then((res) => {
+        if (res && res.rawLrc) {
+          topQQ.rawLrc = res.rawLrc;
+          topQQ.translation = res.translation || "";
+        }
+      }).catch(() => {});
+    }
+  }
+
+  const isAllEnd = settled.every((r) => r.status === "fulfilled" && r.value?.isEnd !== false);
+
+  return {
+    isEnd: isAllEnd || combined.length === 0,
+    data: combined,
+  };
+}
+
+/**
+ * 网易云歌词直连提取通道
+ */
+async function directFetchNetEaseLyric(id) {
+  if (!id) return null;
+  try {
+    const res = await axios.get("https://music.163.com/api/song/lyric", {
+      params: { id, lv: 1, kv: 1, tv: -1 },
+      headers: {
+        Referer: "https://music.163.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+      timeout: 4000,
+    });
+    const rawLrc = res.data?.lrc?.lyric;
+    const translation = res.data?.tlyric?.lyric;
+    if (rawLrc && typeof rawLrc === "string" && rawLrc.trim().length > 10) {
+      return { rawLrc, translation: translation || "" };
+    }
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * QQ 音乐歌词直连提取通道
+ */
+async function directFetchQQLyric(songmid) {
+  if (!songmid) return null;
+  try {
+    const res = await axios.get("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg", {
+      params: {
+        songmid,
+        g_tk: 5381,
+        format: "json",
+        nobase64: 1,
+      },
+      headers: {
+        Referer: "https://y.qq.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+      timeout: 4000,
+    });
+    const rawLrc = res.data?.lyric;
+    const translation = res.data?.trans;
+    if (rawLrc && typeof rawLrc === "string" && rawLrc.trim().length > 10) {
+      return { rawLrc, translation: translation || "" };
+    }
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * 酷我音乐歌词直连提取通道
+ */
+async function directFetchKuwoLyric(rid) {
+  if (!rid) return null;
+  const cleanId = String(rid).replace(/^MUSIC_/, "");
+  try {
+    const res = await axios.get("http://m.kuwo.cn/newh5/singles/songinfoandlrc", {
+      params: { musicId: cleanId },
+      headers: { "User-Agent": "Mozilla/5.0" },
+      timeout: 4000,
+    });
+    const lrclist = res.data?.data?.lrclist;
+    if (Array.isArray(lrclist) && lrclist.length > 0) {
+      const lrcText = lrclist
+        .map((l) => {
+          const time = parseFloat(l.time) || 0;
+          const min = Math.floor(time / 60).toString().padStart(2, "0");
+          const sec = (time % 60).toFixed(2).padStart(5, "0");
+          return `[${min}:${sec}]${l.lineLyric || ""}`;
+        })
+        .join("\n");
+      return { rawLrc: lrcText, translation: "" };
+    }
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * 针对搜索选中的特定歌词项进行精准提取 (0ms 预取命中 + 独立高可用 HTTP 直通)
+ */
+async function resolveDirectLyricItem(musicItem, builtInSources = {}, dynamicSources = []) {
+  // 1. 如果已预加载有 rawLrc，直接 0ms 返回
+  if (musicItem.rawLrc && typeof musicItem.rawLrc === "string" && musicItem.rawLrc.trim().length > 10) {
+    return {
+      rawLrc: musicItem.rawLrc,
+      translation: musicItem.translation || "",
+    };
+  }
+
+  const idStr = String(musicItem.id || "");
+  const rawId = musicItem._rawId || idStr.replace(/^lrc_[a-z0-9]+_/, "");
+
+  // 2. 网易云定向拉取 (优先内置源，备选直连 HTTP)
+  if (musicItem._source === "netease" || idStr.startsWith("lrc_netease_")) {
+    const neSource = builtInSources.netease;
+    if (neSource && typeof neSource.getLyric === "function") {
+      try {
+        const res = await neSource.getLyric({ id: rawId });
+        if (res && res.rawLrc && res.rawLrc.trim().length > 10) return res;
+      } catch (e) {}
+    }
+    const directRes = await directFetchNetEaseLyric(rawId);
+    if (directRes) return directRes;
+  }
+
+  // 3. QQ 音乐定向拉取 (优先内置源，备选直连 HTTP)
+  if (musicItem._source === "qq" || idStr.startsWith("lrc_qq_")) {
+    const qqSource = builtInSources.qq;
+    if (qqSource && typeof qqSource.getLyric === "function") {
+      try {
+        const res = await qqSource.getLyric({ songmid: musicItem.songmid || rawId });
+        if (res && res.rawLrc && res.rawLrc.trim().length > 10) return res;
+      } catch (e) {}
+    }
+    const directRes = await directFetchQQLyric(musicItem.songmid || rawId);
+    if (directRes) return directRes;
+  }
+
+  // 4. 酷我音乐定向拉取 (优先内置源，备选直连 HTTP)
+  if (musicItem._source === "kuwo" || idStr.startsWith("lrc_kuwo_")) {
+    const kwSource = builtInSources.kuwo;
+    if (kwSource && typeof kwSource.getLyric === "function") {
+      try {
+        const res = await kwSource.getLyric({ id: rawId });
+        if (res && res.rawLrc && res.rawLrc.trim().length > 10) return res;
+      } catch (e) {}
+    }
+    const directRes = await directFetchKuwoLyric(rawId);
+    if (directRes) return directRes;
+  }
+  // 5. 动态插件定向拉取
+
+  const matchedDynamic = (dynamicSources || []).find(
+    (ds) => ds && (ds.key === musicItem._source || ds.name === musicItem._source)
+  );
+  if (matchedDynamic && typeof matchedDynamic.getLyric === "function") {
+    try {
+      const res = await matchedDynamic.getLyric({ ...musicItem, id: rawId });
+      if (res && res.rawLrc && res.rawLrc.trim().length > 10) return res;
+    } catch (e) {}
+  }
+
+  return { rawLrc: "", translation: "" };
+}
+
+module.exports = {
+  searchNetEaseLyrics,
+  searchQQLyrics,
+  searchKuwoLyrics,
+  unifiedSearchLyric,
+  resolveDirectLyricItem,
+  directFetchNetEaseLyric,
+  directFetchQQLyric,
+  directFetchKuwoLyric,
+};
+
+  },
   "./core/fallback-pure": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
@@ -2855,6 +3785,13 @@ function scoreSearchResult(item, query) {
  * 统一多源搜索调度 (极速并发 + 1800ms 慢源熔断)
  */
 async function unifiedSearch(query, page = 1, type = "music", env = {}) {
+  // 0. 歌词类型搜索 (搜索歌词弹窗专用通道：0ms 瞬时直达，绝不阻塞网络同步)
+  if (type === "lyric") {
+    const { unifiedSearchLyric } = require("./lyric-searcher");
+    const dynamicSources = getActiveDynamicPlugins("tier0").concat(getActiveDynamicPlugins("tier3"));
+    return await unifiedSearchLyric(query, page, env, {}, dynamicSources);
+  }
+
   const orderedSources = await getOrderedSources(env);
 
   if (orderedSources.length === 0) {
@@ -3389,6 +4326,14 @@ async function resolveMediaSourceWithFallback(
  * 纯净版歌词自动补全
  */
 async function resolveLyricWithFallback(musicItem, env = {}) {
+
+  // 0. 优先检查定向歌词项或直接携带的 rawLrc (如搜索歌词弹窗中点击选中的条目)
+  const { resolveDirectLyricItem } = require("./lyric-searcher");
+  const dynamicSources = getActiveDynamicPlugins("tier0").concat(getActiveDynamicPlugins("tier3"));
+  const directLrc = await resolveDirectLyricItem(musicItem, {}, dynamicSources);
+  if (directLrc && directLrc.rawLrc && directLrc.rawLrc.trim().length > 10) {
+    return directLrc;
+  }
   const orderedSources = await getOrderedSources(env);
   const target = {
     title: musicItem.title || "",
@@ -4138,10 +5083,20 @@ async function resolveArtistWorks(artistItem, page = 1, type = "music") {
   return res || { isEnd: true, data: [] };
 }
 
+/**
+ * 纯净版歌曲评论区多源调度与跨源容灾 (透传动态插件 + 公共热评兜底)
+ */
+async function resolveMusicCommentsWithFallback(musicItem, page = 1, env = {}) {
+  const { resolveMusicCommentsWithFallback: resolveCommentsCore } = require("./comment-resolver");
+  const activeSources = await getOrderedSources(env);
+  return await resolveCommentsCore(musicItem, page, env, activeSources);
+}
+
 module.exports = {
   unifiedSearch,
   resolveMediaSourceWithFallback,
   resolveLyricWithFallback,
+  resolveMusicCommentsWithFallback,
   resolveTopLists,
   resolveTopListDetail,
   resolveRecommendSheetTags,
@@ -4164,6 +5119,7 @@ const {
   unifiedSearch,
   resolveMediaSourceWithFallback,
   resolveLyricWithFallback,
+  resolveMusicCommentsWithFallback,
   resolveTopLists,
   resolveTopListDetail,
   resolveRecommendSheetTags,
@@ -4348,6 +5304,14 @@ const plugin = {
   async getLyric(musicItem) {
     const userEnv = await getUserEnv(this);
     return await resolveLyricWithFallback(musicItem, userEnv);
+  },
+
+  /**
+   * 纯净版歌曲评论区 (支持透传动态插件、跨源热评容灾与分页)
+   */
+  async getMusicComments(musicItem, page = 1) {
+    const userEnv = await getUserEnv(this);
+    return await resolveMusicCommentsWithFallback(musicItem, page, userEnv);
   },
 
   /**
