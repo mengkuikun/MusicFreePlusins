@@ -1,7 +1,7 @@
 /**
  * MusicFree 智能多源聚合与自动容灾换源插件 (纯净版 - 0内置源)
  * 
- * 版本: 1.6.0-pure
+ * 版本: 1.6.1-pure
  * 作者: 夢酷 (mengkuikun)
  * 协议: MIT
  * 
@@ -49,8 +49,40 @@ function formatDuration(duration) {
   return `${mStr}:${sStr}`;
 }
 
+/**
+ * 安全解析音频时长为秒数 (兼容数值秒、数值毫秒与 "mm:ss" / "hh:mm:ss" 字符串)
+ * 解决评分器与比对器因时长格式化为字符串而失效的问题
+ */
+function parseDurationSeconds(duration) {
+  if (duration === undefined || duration === null || duration === "" || duration === 0) {
+    return 0;
+  }
+  if (typeof duration === "number") {
+    if (isNaN(duration) || duration <= 0) return 0;
+    return duration > 10000 ? Math.floor(duration / 1000) : Math.floor(duration);
+  }
+  if (typeof duration === "string") {
+    const s = duration.trim();
+    if (s.includes(":")) {
+      const parts = s.split(":").map(Number);
+      if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+        return parts[0] * 60 + parts[1];
+      }
+      if (parts.length === 3 && !isNaN(parts[0]) && !isNaN(parts[1]) && !isNaN(parts[2])) {
+        return parts[0] * 3600 + parts[1] * 60 + parts[2];
+      }
+    }
+    const sec = Number(s);
+    if (!isNaN(sec) && sec > 0) {
+      return sec > 10000 ? Math.floor(sec / 1000) : Math.floor(sec);
+    }
+  }
+  return 0;
+}
+
 module.exports = {
   formatDuration,
+  parseDurationSeconds,
 };
 
   },
@@ -59,7 +91,7 @@ module.exports = {
 
 const config = {
   platform: "智能多源聚合",
-  version: "1.6.0-pure",
+  version: "1.6.1-pure",
   author: "夢酷 (mengkuikun)",
   srcUrl: "https://raw.githubusercontent.com/mengkuikun/MusicFreePlusins/main/musicfree-auto-fallback-pure.js",
   description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
@@ -126,7 +158,7 @@ module.exports = config;
 
 const config = {
   platform: "智能多源聚合",
-  version: "1.6.0-pure",
+  version: "1.6.1-pure",
   author: "夢酷 (mengkuikun)",
   srcUrl: "https://gitee.com/mengkuikun/music-free-plusins/raw/master/musicfree-auto-fallback-pure.js",
   description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
@@ -893,8 +925,27 @@ async function tryInheritFromPreviousVersions(mfStorage, customFs = null) {
     if (initFlag === "cleared") {
       return { inherited: false, reason: "explicitly_cleared" };
     }
-    if (initFlag === "true") {
+    const currentCache = await mfStorage.getItem(STORAGE_KEY);
+    if (initFlag === "true" && currentCache) {
       return { inherited: false, reason: "already_initialized" };
+    }
+
+    // 1. 无感优先继承：从共享的全局 localStorage 中恢复（不依赖任何本地文件系统权限，纯沙箱自愈）
+    const ls = getLocalStorageSafe();
+    if (ls) {
+      try {
+        const lsRaw = ls.getItem(STORAGE_KEY);
+        if (lsRaw) {
+          const parsed = JSON.parse(lsRaw);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            await mfStorage.setItem(STORAGE_KEY, lsRaw);
+            await mfStorage.setItem(STORAGE_INITIALIZED_KEY, "true");
+            inMemoryStore = parsed.slice();
+            nativeStorageCache.set(STORAGE_KEY, lsRaw);
+            return { inherited: true, count: parsed.length, source: "localStorage" };
+          }
+        }
+      } catch (e) {}
     }
 
     const fs = customFs || getGlobalNodeFs();
@@ -2319,7 +2370,17 @@ module.exports = {
 
 function isInvalid404Url(url) {
   if (!url || typeof url !== "string") return true;
-  if (url.includes("404.mp3") || url.includes("error.mp3")) return true;
+  const u = url.toLowerCase();
+  if (
+    u.includes("/404.html") ||
+    u.includes("/404/") ||
+    u.endsWith("/404") ||
+    u.includes("music.163.com/404") ||
+    u.includes("404.mp3") ||
+    u.includes("error.mp3")
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -3565,7 +3626,7 @@ module.exports = {
 
 const axios = require("axios");
 const { findBestMatch, cleanTitle, cleanArtist } = require("./matcher");
-const { formatDuration } = require("../utils/format");
+const { formatDuration, parseDurationSeconds } = require("../utils/format");
 const {
   syncCustomPlugins,
   getActiveDynamicPlugins,
@@ -3731,12 +3792,20 @@ function scoreSearchResult(item, query) {
     score += 25;
   }
 
-  // 3. 流行歌曲正常时长加分 (150s ~ 360s)
-  const dur = item.duration || 0;
+  // 3. 流行歌曲正常时长加分 (150s ~ 360s，安全支持解析 mm:ss 字符串与毫秒)
+  const dur = parseDurationSeconds(item.duration);
   if (dur >= 150 && dur <= 360) {
     score += 15;
   } else if (dur > 0 && dur < 100) {
     score -= 30;
+  }
+
+  // 3.1 优质正规音源元数据加分 (拥有完整 songmid 与专辑名称)
+  if (item.songmid && typeof item.songmid === "string" && item.songmid.trim().length > 5) {
+    score += 10;
+  }
+  if (item.album && typeof item.album === "string" && item.album.trim().length > 0) {
+    score += 5;
   }
 
   // 4. 噪点标记降权
@@ -3906,19 +3975,29 @@ async function unifiedSearch(query, page = 1, type = "music", env = {}) {
     }
   });
 
-  // 去重并计分
+  // 去重并计分 (含同分智能优选策略)
   const map = new Map();
   for (const item of combined) {
     const key = `${cleanTitle(item.title)}___${cleanArtist(item.artist)}`;
+    const curScore = scoreSearchResult(item, query);
+    item._rankScore = curScore;
+
     if (!map.has(key)) {
-      item._rankScore = scoreSearchResult(item, query);
       map.set(key, item);
     } else {
       const exist = map.get(key);
-      const curScore = scoreSearchResult(item, query);
-      if (curScore > (exist._rankScore || 0)) {
-        item._rankScore = curScore;
+      const existScore = exist._rankScore || 0;
+      if (curScore > existScore) {
         map.set(key, item);
+      } else if (curScore === existScore) {
+        // 同分优选策略：优先选择具备真实非空时长、完整 songmid 标识的优质原版音源
+        const curDur = parseDurationSeconds(item.duration);
+        const existDur = parseDurationSeconds(exist.duration);
+        if (curDur > 0 && existDur === 0) {
+          map.set(key, item);
+        } else if (item.songmid && !exist.songmid) {
+          map.set(key, item);
+        }
       }
     }
   }
@@ -3955,11 +4034,15 @@ const SCRIPT_EXTS = new Set([
  */
 async function normalizeMediaSource(mediaRes) {
   if (!mediaRes || !mediaRes.url || typeof mediaRes.url !== "string") {
-    return mediaRes;
+    return null;
   }
 
   try {
     const rawUrl = mediaRes.url.trim();
+    if (isInvalid404Url(rawUrl)) {
+      return null;
+    }
+
     // 提取 pathname 中的后缀
     const cleanPath = rawUrl.split("?")[0].split("#")[0];
     const match = cleanPath.match(/\.([a-zA-Z0-9]+)$/);
@@ -3970,10 +4053,11 @@ async function normalizeMediaSource(mediaRes) {
       return mediaRes;
     }
 
-    // 2. 若命中脚本后缀（如 .php）或无扩展名，启动轻量 302 追踪与探测
+    // 2. 若命中脚本后缀（如 .php）或无扩展名，启动轻量 302 追踪与流可用性探测
     if (SCRIPT_EXTS.has(ext) || !ext) {
       let finalUrl = rawUrl;
       let contentType = "";
+      let isUnplayableAttachment = false;
 
       try {
         const probeRes = await axios.get(rawUrl, {
@@ -3982,7 +4066,7 @@ async function normalizeMediaSource(mediaRes) {
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           },
           maxRedirects: 5,
-          timeout: 1500,
+          timeout: 2500,
           responseType: "stream",
         });
 
@@ -4001,13 +4085,25 @@ async function normalizeMediaSource(mediaRes) {
           contentType = (
             probeRes.headers["content-type"] || ""
           ).toLowerCase();
+          const disp = (
+            probeRes.headers["content-disposition"] || ""
+          ).toLowerCase();
+          // 若响应头带有 attachment 强制下载标记，或者返回 text/html 错误页，判定为不可流式播放的假直链
+          if (disp.includes("attachment") || contentType.includes("text/html")) {
+            isUnplayableAttachment = true;
+          }
         }
 
         if (probeRes.data && typeof probeRes.data.destroy === "function") {
           probeRes.data.destroy();
         }
       } catch (probeErr) {
-        // 探测失败时保持 rawUrl
+        // 探测失败
+      }
+
+      // 若探测出 attachment 强制下载标记或返回 html 错误页，判定为不可流式播放
+      if (isUnplayableAttachment) {
+        return null;
       }
 
       // 检查追踪后的 URL 是否带有标准音频后缀
@@ -4144,14 +4240,15 @@ async function resolveMediaSourceWithFallback(
 
       if (fallbackRes && fallbackRes.mediaRes) {
         const normRes = await normalizeMediaSource(fallbackRes.mediaRes);
-        return {
-          ...normRes,
-          platform: "智能多源聚合",
-          _sourceUsed: origSource.name || origSource.platform || origSourceKey,
-        };
-      } else {
-        primaryTriedAndFailed = true;
+        if (normRes && normRes.url && !isInvalid404Url(normRes.url)) {
+          return {
+            ...normRes,
+            platform: "智能多源聚合",
+            _sourceUsed: origSource.name || origSource.platform || origSourceKey,
+          };
+        }
       }
+      primaryTriedAndFailed = true;
     }
   }
 
@@ -4250,16 +4347,18 @@ async function resolveMediaSourceWithFallback(
             }
 
             const normRes = await normalizeMediaSource(mediaRes);
-            return {
-              ...normRes,
-              platform: "智能多源聚合",
-              _sourceUsed:
-                candidate.source.name ||
-                candidate.source.platform ||
-                "动态源",
-              _matchedSong: `${candidate.bestMatch.title} - ${candidate.bestMatch.artist}`,
-              _matchScore: candidate.bestMatch._matchScore,
-            };
+            if (normRes && normRes.url && !isInvalid404Url(normRes.url)) {
+              return {
+                ...normRes,
+                platform: "智能多源聚合",
+                _sourceUsed:
+                  candidate.source.name ||
+                  candidate.source.platform ||
+                  "动态源",
+                _matchedSong: `${candidate.bestMatch.title} - ${candidate.bestMatch.artist}`,
+                _matchScore: candidate.bestMatch._matchScore,
+              };
+            }
           }
         } catch (mediaErr) {}
       }
