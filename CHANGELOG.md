@@ -4,6 +4,23 @@
 
 ---
 
+## [v1.6.2] - 2026-11-25
+
+> 🛠️ **排行榜稳定性与推荐歌单解析修复**：彻底解决 Windows Electron 下官方榜单/歌单 HTTPS TLS 握手断开导致的「获取排行榜失败」及 8s 超时阻塞，并隔离第三方动态插件排行榜异常。
+
+---
+
+### 📊 1. 排行榜全端健壮性与分组规范修复 (`fix(toplist)`)
+1. **官方榜单与详情直通防阻断**：
+   - 将网易云（`/api/toplist`、`/api/v6/playlist/detail`）与 QQ 音乐（`fcg_myqq_toplist.fcg`、`fcg_v8_toplist_cp.fcg`）榜单及推荐歌单接口切换为免 TLS 握手异常的 HTTP 通道，消除 Windows Electron 运行时 `Client network socket disconnected before secure TLS connection was established` 报错，列表首屏响应缩短至百毫秒级。
+2. **动态插件异常与冷启动阻断隔离**：
+   - 新增 `safeTopListTask` 安全任务包装器，统一通过 `Promise.resolve`、`try/catch` 与 `3000ms` 超时熔断隔离动态音源插件榜单拉取，避免非 Promise 返回值、同步抛错或慢源引发整体榜单崩溃。
+   - 纯净版 `resolveTopLists` 仅等待本地缓存恢复（`ensureDynamicPluginsReady(1000)`），不阻塞在远程合集全量下载；`resolveTopListDetail` 优先直连官方榜单通道，再回退动态插件。
+3. **网易云榜单分组展示优化**：
+   - 取消原始单字母分组（`S` / `N` / `O` / `H`），统一归类为「**网易云音乐官方榜单**」与「**网易云特色/全球榜**」，并规范传递 `userVariables` 环境配置。
+
+---
+
 ## [v1.6.1] - 2026-10-12
 
 > 🛠️ **容灾换源与多源搜索健壮性修复**：彻底修复多源去重时优质音源被劣质源截胡、音频直链带 Attachment 强制下载头导致桌面端播放器卡死的问题，增强沙箱持久化继承。

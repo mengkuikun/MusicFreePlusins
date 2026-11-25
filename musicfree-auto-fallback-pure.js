@@ -1,7 +1,7 @@
 /**
  * MusicFree 智能多源聚合与自动容灾换源插件 (纯净版 - 0内置源)
  * 
- * 版本: 1.6.1-pure
+ * 版本: 1.6.2-pure
  * 作者: 夢酷 (mengkuikun)
  * 协议: MIT
  * 
@@ -91,7 +91,7 @@ module.exports = {
 
 const config = {
   platform: "智能多源聚合",
-  version: "1.6.1-pure",
+  version: "1.6.2-pure",
   author: "夢酷 (mengkuikun)",
   srcUrl: "https://raw.githubusercontent.com/mengkuikun/MusicFreePlusins/main/musicfree-auto-fallback-pure.js",
   description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
@@ -158,7 +158,7 @@ module.exports = config;
 
 const config = {
   platform: "智能多源聚合",
-  version: "1.6.1-pure",
+  version: "1.6.2-pure",
   author: "夢酷 (mengkuikun)",
   srcUrl: "https://gitee.com/mengkuikun/music-free-plusins/raw/master/musicfree-auto-fallback-pure.js",
   description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
@@ -4491,59 +4491,61 @@ async function resolveTopLists(env = {}) {
   const results = [];
   const tasks = [];
 
-  // 1. 优先聚合已加载的动态音源插件榜单
-  const orderedSources = await getOrderedSources(env);
-  for (const source of orderedSources) {
-    if (typeof source.getTopLists === "function") {
+  // 仅等待本地磁盘/缓存恢复，不在此触发耗时的远程全量插件订阅下载
+  await ensureDynamicPluginsReady(1000);
+
+  /**
+   * 包装单源榜单拉取任务，隔离同步异常、非 Promise 返回及网络超时
+   */
+  const safeTopListTask = (fn, transform, timeoutMs = 3000) => {
+    try {
+      const p = Promise.resolve(fn())
+        .then((res) => (transform ? transform(res) : res))
+        .catch(() => []);
+      return Promise.race([
+        p,
+        new Promise((resolve) => setTimeout(() => resolve([]), timeoutMs)),
+      ]);
+    } catch (e) {
+      return Promise.resolve([]);
+    }
+  };
+
+  // 1. 优先聚合已在内存中注册的动态音源插件榜单
+  const blacklist = getBlacklistSet(env);
+  const dynamicSources = getActiveDynamicPlugins("tier0").concat(
+    getActiveDynamicPlugins("tier3")
+  );
+  for (const source of dynamicSources) {
+    if (
+      source &&
+      typeof source.getTopLists === "function" &&
+      !isSourceBlacklisted(source.key, source.platform || source.name, blacklist)
+    ) {
       tasks.push(
-        source.getTopLists().then((res) => {
-          if (Array.isArray(res)) {
-            return res.map((group) => ({
-              ...group,
-              title: `[动态源] ${group.title || source.platform || source.name || "自定义榜单"}`,
-            }));
-          }
-          return [];
-        }).catch(() => [])
+        safeTopListTask(
+          () => source.getTopLists(),
+          (res) =>
+            Array.isArray(res)
+              ? res.map((group) => ({
+                  ...group,
+                  title: `[动态源] ${group.title || source.platform || source.name || "自定义榜单"}`,
+                }))
+              : [],
+          3000
+        )
       );
     }
   }
 
-  // 2. 网易云官方榜单
-  tasks.push(
-    axios.get("https://music.163.com/api/toplist", {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Referer: "https://music.163.com/",
-      },
-      timeout: 8000,
-    }).then((res) => {
-      const list = res.data?.list || [];
-      return [
-        {
-          title: "网易云音乐官方榜单",
-          data: list.map((item) => ({
-            id: `ne_${item.id}`,
-            sheetId: item.id,
-            title: item.name,
-            artwork: item.coverImgUrl,
-            description: item.description || "",
-            platform: "智能多源聚合",
-            _source: "netease",
-          })),
-        },
-      ];
-    }).catch(() => [])
-  );
-
-  // 3. 酷我音乐官方榜单
+  // 2. 酷我音乐官方榜单 (即时返回，0ms 可用)
   const KUWO_BANGS = [
-    { id: "16", title: "酷我热歌榜", artwork: "https://img4.kuwo.cn/star/albumcover/300/16.jpg", description: "酷我音乐全网热播金曲" },
-    { id: "17", title: "酷我新歌榜", artwork: "https://img4.kuwo.cn/star/albumcover/300/17.jpg", description: "酷我音乐最新发行优质单曲" },
-    { id: "93", title: "抖音热歌榜", artwork: "https://img4.kuwo.cn/star/albumcover/300/93.jpg", description: "短视频爆款流行神曲" },
-    { id: "62", title: "酷我飙升榜", artwork: "https://img4.kuwo.cn/star/albumcover/300/62.jpg", description: "当前搜索与播放飙升热单" },
-    { id: "158", title: "快手热歌榜", artwork: "https://img4.kuwo.cn/star/albumcover/300/158.jpg", description: "快手平台热门背景音乐" },
-    { id: "187", title: "国风热歌榜", artwork: "https://img4.kuwo.cn/star/albumcover/300/187.jpg", description: "全网国风古韵高人气热曲" },
+    { id: "16", title: "酷我热歌榜", artwork: "http://img4.kuwo.cn/star/albumcover/300/16.jpg", description: "酷我音乐全网热播金曲" },
+    { id: "17", title: "酷我新歌榜", artwork: "http://img4.kuwo.cn/star/albumcover/300/17.jpg", description: "酷我音乐最新发行优质单曲" },
+    { id: "93", title: "抖音热歌榜", artwork: "http://img4.kuwo.cn/star/albumcover/300/93.jpg", description: "短视频爆款流行神曲" },
+    { id: "62", title: "酷我飙升榜", artwork: "http://img4.kuwo.cn/star/albumcover/300/62.jpg", description: "当前搜索与播放飙升热单" },
+    { id: "158", title: "快手热歌榜", artwork: "http://img4.kuwo.cn/star/albumcover/300/158.jpg", description: "快手平台热门背景音乐" },
+    { id: "187", title: "国风热歌榜", artwork: "http://img4.kuwo.cn/star/albumcover/300/187.jpg", description: "全网国风古韵高人气热曲" },
   ];
   tasks.push(
     Promise.resolve([
@@ -4562,38 +4564,88 @@ async function resolveTopLists(env = {}) {
     ])
   );
 
-  // 4. QQ音乐官方榜单
+  // 3. 网易云官方榜单 (使用 http://music.163.com 避开 Node/Electron TLS 握手异常)
   tasks.push(
-    axios.get("https://c.y.qq.com/v8/fcg-bin/fcg_myqq_toplist.fcg", {
-      params: {
-        format: "json",
-        g_tk: 5381,
-        uin: 0,
-        inCharset: "utf-8",
-        outCharset: "utf-8",
-        notice: 0,
-        platform: "h5",
-        needNewCode: 1,
-      },
-      headers: { Referer: "https://y.qq.com/" },
-      timeout: 8000,
-    }).then((res) => {
-      const list = res.data?.data?.topList || [];
-      return [
-        {
-          title: "QQ音乐官方榜单",
-          data: list.map((item) => ({
-            id: `qq_${item.id}`,
-            topId: item.id,
-            title: item.topTitle,
-            artwork: item.pic_v12 || item.pic_h5 || item.pic || "",
-            description: `收听人数: ${item.listenCount || "热播"}`,
+    safeTopListTask(
+      () =>
+        axios.get("http://music.163.com/api/toplist", {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            Referer: "http://music.163.com/",
+          },
+          timeout: 3000,
+        }),
+      (res) => {
+        const list = res.data?.list || [];
+        const official = [];
+        const special = [];
+
+        list.forEach((item) => {
+          const entry = {
+            id: `ne_${item.id}`,
+            sheetId: item.id,
+            title: item.name,
+            artwork: item.coverImgUrl,
+            description: item.description || "",
             platform: "智能多源聚合",
-            _source: "qq",
-          })),
-        },
-      ];
-    }).catch(() => [])
+            _source: "netease",
+          };
+          if (
+            ["S", "N", "O", "H"].includes(item.ToplistType) ||
+            ["云音乐飙升榜", "云音乐新歌榜", "网易原创歌曲榜", "云音乐热歌榜"].includes(item.name)
+          ) {
+            official.push(entry);
+          } else {
+            special.push(entry);
+          }
+        });
+
+        const groups = [];
+        if (official.length > 0) groups.push({ title: "网易云音乐官方榜单", data: official });
+        if (special.length > 0) groups.push({ title: "网易云特色/全球榜", data: special });
+        return groups;
+      },
+      3000
+    )
+  );
+
+  // 4. QQ音乐官方榜单 (使用 http://c.y.qq.com 避开 Node/Electron TLS 握手异常)
+  tasks.push(
+    safeTopListTask(
+      () =>
+        axios.get("http://c.y.qq.com/v8/fcg-bin/fcg_myqq_toplist.fcg", {
+          params: {
+            format: "json",
+            g_tk: 5381,
+            uin: 0,
+            inCharset: "utf-8",
+            outCharset: "utf-8",
+            notice: 0,
+            platform: "h5",
+            needNewCode: 1,
+          },
+          headers: { Referer: "http://y.qq.com/" },
+          timeout: 3000,
+        }),
+      (res) => {
+        const list = res.data?.data?.topList || [];
+        return [
+          {
+            title: "QQ音乐官方榜单",
+            data: list.map((item) => ({
+              id: `qq_${item.id}`,
+              topId: item.id,
+              title: item.topTitle,
+              artwork: item.pic_v12 || item.pic_h5 || item.pic || "",
+              description: `收听人数: ${item.listenCount || "热播"}`,
+              platform: "智能多源聚合",
+              _source: "qq",
+            })),
+          },
+        ];
+      },
+      3000
+    )
   );
 
   const allSettled = await Promise.allSettled(tasks);
@@ -4614,30 +4666,12 @@ async function resolveTopLists(env = {}) {
 }
 
 /**
- * 获取榜单歌曲详情 (多源容灾)
+ * 获取榜单歌曲详情 (官方直通毫秒响应 + 动态插件容灾)
  */
 async function resolveTopListDetail(topListItem, env = {}) {
-  // 1. 尝试动态插件获取
-  const orderedSources = await getOrderedSources(env);
-  for (const source of orderedSources) {
-    if (typeof source.getTopListDetail === "function") {
-      try {
-        const res = await source.getTopListDetail(topListItem);
-        if (res && Array.isArray(res.musicList) && res.musicList.length > 0) {
-          res.musicList = res.musicList.map((s) => ({
-            ...s,
-            duration: formatDuration(s.duration),
-            platform: "智能多源聚合",
-          }));
-          return res;
-        }
-      } catch (e) {}
-    }
-  }
-
   const rawId = String(topListItem.sheetId || topListItem.bangId || topListItem.topId || topListItem.id || "");
 
-  // 2. 酷我榜单详情
+  // 1. 酷我榜单详情
   if (topListItem._source === "kuwo" || String(topListItem.id).startsWith("kw_")) {
     const cleanId = rawId.replace("kw_", "");
     try {
@@ -4651,7 +4685,7 @@ async function resolveTopListDetail(topListItem, env = {}) {
           pn: 0,
           rn: 50,
         },
-        timeout: 8000,
+        timeout: 6000,
       });
       const musiclist = res.data?.musiclist || [];
       const songs = musiclist.map((item) => {
@@ -4677,11 +4711,11 @@ async function resolveTopListDetail(topListItem, env = {}) {
     } catch (e) {}
   }
 
-  // 3. QQ 榜单详情
+  // 2. QQ 榜单详情
   if (topListItem._source === "qq" || String(topListItem.id).startsWith("qq_")) {
     const cleanId = rawId.replace("qq_", "");
     try {
-      const res = await axios.get("https://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_cp.fcg", {
+      const res = await axios.get("http://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_cp.fcg", {
         params: {
           g_tk: 5381,
           uin: 0,
@@ -4698,8 +4732,8 @@ async function resolveTopListDetail(topListItem, env = {}) {
           song_begin: 0,
           song_num: 50,
         },
-        headers: { Referer: "https://y.qq.com/" },
-        timeout: 8000,
+        headers: { Referer: "http://y.qq.com/" },
+        timeout: 6000,
       });
       const songlist = res.data?.songlist || [];
       const songs = songlist.map((item) => {
@@ -4726,40 +4760,60 @@ async function resolveTopListDetail(topListItem, env = {}) {
     } catch (e) {}
   }
 
-  // 4. 网易云榜单详情
-  try {
+  // 3. 网易云榜单详情
+  if (topListItem._source === "netease" || String(topListItem.id).startsWith("ne_")) {
     const cleanId = rawId.replace("ne_", "");
-    const res = await axios.get(
-      `https://music.163.com/api/v6/playlist/detail?id=${cleanId}`,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          Referer: "https://music.163.com/",
-        },
-        timeout: 8000,
-      }
-    );
-    const playlist = res.data?.playlist;
-    const tracks = (playlist?.tracks || []).map((s) => ({
-      id: String(s.id),
-      title: s.name,
-      artist: (s.ar || s.artists || []).map((a) => a.name).join(", "),
-      album: s.al?.name || "",
-      artwork: s.al?.picUrl || "",
-      duration: formatDuration(s.dt ? Math.floor(s.dt / 1000) : 0),
-      platform: "智能多源聚合",
-      _source: "netease",
-    }));
+    try {
+      const res = await axios.get(
+        `http://music.163.com/api/v6/playlist/detail?id=${cleanId}`,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            Referer: "http://music.163.com/",
+          },
+          timeout: 6000,
+        }
+      );
+      const playlist = res.data?.playlist;
+      const tracks = (playlist?.tracks || []).map((s) => ({
+        id: String(s.id),
+        title: s.name,
+        artist: (s.ar || s.artists || []).map((a) => a.name).join(", "),
+        album: s.al?.name || "",
+        artwork: s.al?.picUrl || "",
+        duration: formatDuration(s.dt ? Math.floor(s.dt / 1000) : 0),
+        platform: "智能多源聚合",
+        _source: "netease",
+      }));
 
-    return {
-      ...topListItem,
-      musicList: tracks,
-      description: playlist?.description || topListItem.description || "",
-    };
-  } catch (err) {
-    return { ...topListItem, musicList: [] };
+      return {
+        ...topListItem,
+        musicList: tracks,
+        description: playlist?.description || topListItem.description || "",
+      };
+    } catch (e) {}
   }
+
+  // 4. 动态插件榜单详情获取
+  const orderedSources = await getOrderedSources(env);
+  for (const source of orderedSources) {
+    if (typeof source.getTopListDetail === "function") {
+      try {
+        const res = await Promise.resolve(source.getTopListDetail(topListItem));
+        if (res && Array.isArray(res.musicList) && res.musicList.length > 0) {
+          res.musicList = res.musicList.map((s) => ({
+            ...s,
+            duration: formatDuration(s.duration),
+            platform: "智能多源聚合",
+          }));
+          return res;
+        }
+      } catch (e) {}
+    }
+  }
+
+  return { ...topListItem, musicList: [] };
 }
 
 /**
@@ -4843,14 +4897,14 @@ async function resolveRecommendSheetsByTag(tag, page = 1) {
 
   try {
     const res = await axios.get(
-      `https://music.163.com/api/playlist/list?cat=${encodeURIComponent(
+      `http://music.163.com/api/playlist/list?cat=${encodeURIComponent(
         cat
       )}&limit=${limit}&offset=${offset}&order=hot`,
       {
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          Referer: "https://music.163.com/",
+          Referer: "http://music.163.com/",
         },
         timeout: 8000,
       }
@@ -4884,12 +4938,12 @@ async function resolveMusicSheetInfo(sheetItem, page = 1) {
   if (sheetItem.id) {
     try {
       const apiRes = await axios.get(
-        `https://music.163.com/api/v6/playlist/detail?id=${sheetItem.id}`,
+        `http://music.163.com/api/v6/playlist/detail?id=${sheetItem.id}`,
         {
           headers: {
             "User-Agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            Referer: "https://music.163.com/",
+            Referer: "http://music.163.com/",
           },
           timeout: 8000,
         }
@@ -4924,7 +4978,7 @@ async function resolveMusicSheetInfo(sheetItem, page = 1) {
   // 2. 安全兜底：通过歌单标题在网易云精确检索
   if ((!res || !Array.isArray(res.musicList) || res.musicList.length === 0) && sheetItem.title) {
     try {
-      const searchRes = await axios.get("https://music.163.com/api/search/get/web", {
+      const searchRes = await axios.get("http://music.163.com/api/search/get/web", {
         params: { s: sheetItem.title, type: 1000, limit: 1 },
         headers: { "User-Agent": "Mozilla/5.0" },
         timeout: 8000,
@@ -4932,12 +4986,12 @@ async function resolveMusicSheetInfo(sheetItem, page = 1) {
       const exactSheet = searchRes.data?.result?.playlists?.[0];
       if (exactSheet && exactSheet.id) {
         const detailRes = await axios.get(
-          `https://music.163.com/api/v6/playlist/detail?id=${exactSheet.id}`,
+          `http://music.163.com/api/v6/playlist/detail?id=${exactSheet.id}`,
           {
             headers: {
               "User-Agent":
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-              Referer: "https://music.163.com/",
+              Referer: "http://music.163.com/",
             },
             timeout: 8000,
           }
@@ -5417,35 +5471,40 @@ const plugin = {
    * 获取官方榜单 (使插件出现在客户端【排行榜】分类中)
    */
   async getTopLists() {
-    return await resolveTopLists();
+    const userEnv = await getUserEnv(this);
+    return await resolveTopLists(userEnv);
   },
 
   /**
    * 获取榜单详情
    */
   async getTopListDetail(topListItem) {
-    return await resolveTopListDetail(topListItem);
+    const userEnv = await getUserEnv(this);
+    return await resolveTopListDetail(topListItem, userEnv);
   },
 
   /**
    * 获取热门/推荐歌单标签 (使插件出现在客户端【热门歌单】分类中)
    */
   async getRecommendSheetTags() {
-    return await resolveRecommendSheetTags();
+    const userEnv = await getUserEnv(this);
+    return await resolveRecommendSheetTags(userEnv);
   },
 
   /**
    * 按标签获取热门/推荐歌单列表
    */
   async getRecommendSheetsByTag(tag, page = 1) {
-    return await resolveRecommendSheetsByTag(tag, page);
+    const userEnv = await getUserEnv(this);
+    return await resolveRecommendSheetsByTag(tag, page, userEnv);
   },
 
   /**
    * 获取歌单内歌曲列表详情
    */
   async getMusicSheetInfo(sheetItem, page = 1) {
-    return await resolveMusicSheetInfo(sheetItem, page);
+    const userEnv = await getUserEnv(this);
+    return await resolveMusicSheetInfo(sheetItem, page, userEnv);
   },
 
   /**
