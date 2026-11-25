@@ -1,7 +1,7 @@
 /**
  * MusicFree 智能多源聚合与自动容灾换源插件 (纯净版 - 0内置源)
  * 
- * 版本: 1.6.2-pure
+ * 版本: 1.7.0-pure
  * 作者: 夢酷 (mengkuikun)
  * 协议: MIT
  * 
@@ -86,12 +86,215 @@ module.exports = {
 };
 
   },
+  "./utils/http": function(module, exports, require, env, getUserVariables, __musicfree_require) {
+"use strict";
+
+const axios = require("axios");
+
+/**
+ * 在 Node / Electron 环境下经常出现 TLS 握手断开的传统 HTTP 兼容域名
+ */
+const LEGACY_HTTP_HOSTS = new Set([
+  "music.163.com",
+  "c.y.qq.com",
+  "u.y.qq.com",
+  "y.qq.com",
+  "search.kuwo.cn",
+  "m.kuwo.cn",
+  "kbangserver.kuwo.cn",
+  "antiserver.kuwo.cn",
+  "mobilecdn.kugou.com",
+  "d.musicapp.migu.cn",
+  "c.musicapp.migu.cn",
+  "m.music.migu.cn",
+]);
+
+/**
+ * 运行期记忆已确认需要回退为 HTTP 的域名，避免重复等待 TLS 失败耗时
+ */
+const preferHttpHosts = new Set();
+
+function extractHostname(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch (e) {
+    return "";
+  }
+}
+
+function isWindowsPlatform() {
+  try {
+    return typeof process !== "undefined" && process.platform === "win32";
+  } catch (e) {
+    return false;
+  }
+}
+
+function swapProtocol(url, targetProtocol) {
+  if (!url || typeof url !== "string") return url;
+  if (targetProtocol === "http:") {
+    return url.replace(/^https:\/\//i, "http://");
+  }
+  if (targetProtocol === "https:") {
+    return url.replace(/^http:\/\//i, "https://");
+  }
+  return url;
+}
+
+function normalizeHeadersForProtocol(headers, targetProtocol) {
+  if (!headers || typeof headers !== "object") return headers;
+  const next = { ...headers };
+  for (const key of Object.keys(next)) {
+    const lk = key.toLowerCase();
+    if ((lk === "referer" || lk === "origin") && typeof next[key] === "string") {
+      next[key] = swapProtocol(next[key], targetProtocol);
+    }
+  }
+  return next;
+}
+
+function isTlsOrConnectionError(err) {
+  if (!err) return false;
+  if (err.response) return false;
+  const msg = String(err.message || "").toLowerCase();
+  const code = String(err.code || "").toUpperCase();
+  return (
+    code === "ECONNRESET" ||
+    code === "ECONNREFUSED" ||
+    code === "EPROTO" ||
+    code === "ETIMEDOUT" ||
+    code.startsWith("ERR_TLS") ||
+    code.startsWith("ERR_SSL") ||
+    msg.includes("tls") ||
+    msg.includes("ssl") ||
+    msg.includes("socket disconnected") ||
+    msg.includes("econnreset") ||
+    msg.includes("certificate")
+  );
+}
+
+/**
+ * 智能协议容错 HTTP 请求：
+ * - 非 Windows 端或非传统兼容域名：优先使用 HTTPS，仅在 TLS/连接异常时自动降级 HTTP 重试并记忆域名；
+ * - Windows Electron 桌面端针对国内已确认 TLS 易断连的传统音频接口：直接走 HTTP 并支持反向回退 HTTPS，避免 3s 超时熔断误杀。
+ */
+async function httpRequest(method, url, dataOrConfig = {}, maybeConfig = null) {
+  const isPostLike = method === "post" || method === "put" || method === "patch";
+  const config = isPostLike ? (maybeConfig || {}) : (dataOrConfig || {});
+  const host = extractHostname(url);
+
+  const shouldPreferHttp =
+    url.startsWith("https://") &&
+    (preferHttpHosts.has(host) || (isWindowsPlatform() && LEGACY_HTTP_HOSTS.has(host)));
+
+  const primaryProto = shouldPreferHttp ? "http:" : (url.startsWith("http://") ? "http:" : "https:");
+  const secondaryProto = primaryProto === "https:" ? "http:" : "https:";
+
+  const buildConfig = (proto) => ({
+    ...config,
+    headers: normalizeHeadersForProtocol(config.headers, proto),
+  });
+
+  const execute = (targetUrl, cfg) => {
+    if (isPostLike) {
+      return axios[method](targetUrl, dataOrConfig, cfg);
+    }
+    return axios[method](targetUrl, cfg);
+  };
+
+  const primaryUrl = swapProtocol(url, primaryProto);
+  try {
+    return await execute(primaryUrl, buildConfig(primaryProto));
+  } catch (err) {
+    if (host && (LEGACY_HTTP_HOSTS.has(host) || primaryProto === "https:") && isTlsOrConnectionError(err)) {
+      if (secondaryProto === "http:" && host) {
+        preferHttpHosts.add(host);
+      }
+      const fallbackUrl = swapProtocol(url, secondaryProto);
+      return await execute(fallbackUrl, buildConfig(secondaryProto));
+    }
+    throw err;
+  }
+}
+
+function httpGet(url, config = {}) {
+  return httpRequest("get", url, config);
+}
+
+function httpPost(url, data, config = {}) {
+  return httpRequest("post", url, data, config);
+}
+
+/**
+ * 统一解析用户环境变量中的布尔开关（兼容 true/false/0/1/开/关/是/否 与大小写、空白）
+ */
+function parseBooleanFlag(value, defaultValue = true) {
+  if (value === undefined || value === null) return defaultValue;
+  if (typeof value === "boolean") return value;
+  const norm = String(value).trim().toLowerCase();
+  if (!norm) return defaultValue;
+  if (norm === "false" || norm === "0" || norm === "no" || norm === "off" || norm === "关" || norm === "关闭" || norm === "否") {
+    return false;
+  }
+  if (norm === "true" || norm === "1" || norm === "yes" || norm === "on" || norm === "开" || norm === "开启" || norm === "是") {
+    return true;
+  }
+  return defaultValue;
+}
+
+/**
+ * 宽松解析 JSON / 酷我类 JSONP-like 响应：
+ * 1. 若 axios 已自动反序列化为对象/数组，直接返回（避免拼串报错）；
+ * 2. 优先尝试标准 JSON.parse，其次做单引号与 True/False 规范化再 JSON.parse；
+ * 3. 仅当去空白后确实以 `{` 或 `[` 开头时，才允许使用 Function 兜底，防止 HTML 错误页触发执行。
+ */
+function parseLooseJson(data) {
+  if (!data) return null;
+  if (typeof data === "object") return data;
+  if (typeof data !== "string") return null;
+
+  const trimmed = data.trim();
+  if (!trimmed || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch (e1) {}
+
+  try {
+    const normalized = trimmed
+      .replace(/'/g, '"')
+      .replace(/True/g, "true")
+      .replace(/False/g, "false");
+    return JSON.parse(normalized);
+  } catch (e2) {}
+
+  try {
+    return Function('"use strict"; return (' + trimmed + ");")();
+  } catch (e3) {
+    return null;
+  }
+}
+
+module.exports = {
+  httpGet,
+  httpPost,
+  httpRequest,
+  parseBooleanFlag,
+  parseLooseJson,
+  isTlsOrConnectionError,
+  LEGACY_HTTP_HOSTS,
+};
+
+
+  },
   "./config-pure": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
 const config = {
   platform: "智能多源聚合",
-  version: "1.6.2-pure",
+  version: "1.7.0-pure",
   author: "夢酷 (mengkuikun)",
   srcUrl: "https://raw.githubusercontent.com/mengkuikun/MusicFreePlusins/main/musicfree-auto-fallback-pure.js",
   description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
@@ -147,72 +350,10 @@ const config = {
       name: "跨源热评",
       hint: "音源无评论时自动拉取网易云/QQ热评（填 true 或 false，默认 true）",
     },
-  ],
-};
-
-module.exports = config;
-
-  },
-  "./config": function(module, exports, require, env, getUserVariables, __musicfree_require) {
-"use strict";
-
-const config = {
-  platform: "智能多源聚合",
-  version: "1.6.2-pure",
-  author: "夢酷 (mengkuikun)",
-  srcUrl: "https://gitee.com/mengkuikun/music-free-plusins/raw/master/musicfree-auto-fallback-pure.js",
-  description: "纯净框架版 0 内置源多源聚合与自动容灾换源插件 (支持自定义单插件及合集订阅)",
-  cacheControl: "no-cache",
-  defaultArtwork: "https://github.com/mengkuikun.png",
-  supportedSearchType: ["music", "album", "artist", "sheet", "lyric"],
-  hints: {
-    importMusicSheet: [
-      "输入 status 查看活跃音源看板",
-      "输入 cache 查看换源秒开记忆看板",
-      "输入 clearcache 清空秒开记忆",
-      "输入 del <名称> 彻底删除指定音源",
-      "输入 update 一键体检并更新所有源",
-      "输入 clear 一键清空重置所有数据",
-    ],
-  },
-
-  defaultHeaders: {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    Accept: "*/*",
-  },
-
-  // 纯净版用户变量：0 内置源，全量依靠用户自定义动态插件或订阅合集
-  userVariables: [
     {
-      key: "tier0PluginUrls",
-      name: "优先音源",
-      hint: "填入 .js 插件链接或 .json 插件合集链接（如: https://music.nairocy.com/plugins.json）",
-    },
-    {
-      key: "tier3PluginUrls",
-      name: "兜底音源",
-      hint: "填入仅在全网失效时触发兜底的备用 .js / .json 链接",
-    },
-    {
-      key: "tierBlacklist",
-      name: "屏蔽音源",
-      hint: "填入要禁用的源名称（如: webdav, 5sing，多个用逗号隔开）",
-    },
-    {
-      key: "autoQualityDowngrade",
-      name: "音质降级",
-      hint: "高音质或无损失效时自动向下兼容播放（填 true 或 false，默认 true）",
-    },
-    {
-      key: "enableMatchCache",
-      name: "秒开记忆",
-      hint: "记住可用音源实现 10ms 秒开与失效自愈（填 true 或 false，默认 true）",
-    },
-    {
-      key: "enableCrossComments",
-      name: "跨源热评",
-      hint: "音源无评论时自动拉取网易云/QQ热评（填 true 或 false，默认 true）",
+      key: "showSourceInLyric",
+      name: "歌词显示音源",
+      hint: "在歌词开头实时显示当前实际播放的音源名称（填 true 或 false，默认 true）",
     },
   ],
 };
@@ -254,6 +395,7 @@ function cleanTitle(title) {
 function cleanArtist(artist) {
   if (!artist || typeof artist !== "string") return "";
   return artist
+    .replace(/\s*[（(][^）)]*[）)]/g, "")
     .replace(/[,，/、&|]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -612,45 +754,105 @@ module.exports = {
 "use strict";
 
 const { cleanTitle, cleanArtist } = require("./matcher");
+const { getLocalStorageSafe, getMusicFreeNativeStorage } = require("./storage");
 
 const CACHE_STORAGE_KEY = "mf_match_memory_cache_v1";
+const MAX_PERSISTED_CACHE_ENTRIES = 220;
 
-function getLocalStorageSafe() {
-  try {
-    if (
-      typeof localStorage !== "undefined" &&
-      localStorage &&
-      typeof localStorage.getItem === "function"
-    ) {
-      return localStorage;
+const KEEP_LARGE_ITEM_KEYS = new Set(["id", "url", "artwork", "lrc", "formats"]);
+const KEEP_STRUCTURED_KEYS = new Set(["formats", "qualities", "extra", "meta"]);
+const MAX_STRUCTURED_JSON_LEN = 2048;
+const STRIP_ITEM_KEYS = new Set([
+  "singerList",
+  "lyric",
+  "rawLrc",
+  "translation",
+  "klyric",
+  "romalrc",
+  "_raw",
+  "musicList",
+]);
+
+function compactMatchedItem(item) {
+  if (!item || typeof item !== "object") return item;
+  const compact = {};
+  for (const [k, v] of Object.entries(item)) {
+    if (STRIP_ITEM_KEYS.has(k) || v === undefined || v === null) continue;
+    if (typeof v === "function") continue;
+    if (typeof v === "object") {
+      if (KEEP_STRUCTURED_KEYS.has(k)) {
+        try {
+          const serialized = JSON.stringify(v);
+          if (serialized && serialized.length <= MAX_STRUCTURED_JSON_LEN) {
+            compact[k] = JSON.parse(serialized);
+          }
+        } catch (e) {}
+      }
+      continue;
     }
-  } catch (e) {}
-  try {
-    if (
-      typeof globalThis !== "undefined" &&
-      globalThis.localStorage &&
-      typeof globalThis.localStorage.getItem === "function"
-    ) {
-      return globalThis.localStorage;
-    }
-  } catch (e) {}
-  return null;
+    if (typeof v === "string" && v.length > 512 && !KEEP_LARGE_ITEM_KEYS.has(k)) continue;
+    compact[k] = v;
+  }
+  return compact;
 }
 
 /**
- * LRU 智能换源秒开记忆缓存 (支持本地持久化秒存秒读，重启软件依然 10ms 秒开)
- * 存储结构: key -> { sourceKey, item, time }
+ * LRU 智能换源秒开记忆缓存 (支持桌面端 musicfree/storage 与 Web/移动端 localStorage 双端持久化)
+ * 存储结构: key -> { sourceKey, sourceName, isFallback, item, time }
  */
 class MatchCacheManager {
   constructor(maxSize = 500, ttlMs = 7 * 24 * 60 * 60 * 1000) {
     this.maxSize = maxSize;
     this.ttlMs = ttlMs; // 默认记忆有效期 7 天
     this.cache = new Map();
+    this._tombstones = new Set();
+    this._clearedAt = 0;
+    this._lastRawLength = 0;
+    this._nativeReady = false;
+    this._quotaExceeded = false;
     this._loadFromDisk();
+    this._initPromise = this._initNativeStorage();
   }
 
   _getKey(title, artist) {
     return `${cleanTitle(title)}___${cleanArtist(artist)}`.toLowerCase().trim();
+  }
+
+  _hydrateList(raw, loadedAt = Date.now()) {
+    if (!raw || typeof raw !== "string") return;
+    this._lastRawLength = raw.length;
+    try {
+      const list = JSON.parse(raw);
+      if (!Array.isArray(list)) return;
+      const now = Date.now();
+      for (const entry of list) {
+        if (
+          entry &&
+          entry.key &&
+          entry.sourceKey &&
+          entry.item &&
+          now - (entry.time || 0) <= this.ttlMs
+        ) {
+          if (this._tombstones.has(entry.key) || (entry.time || 0) < this._clearedAt) {
+            continue;
+          }
+          const existing = this.cache.get(entry.key);
+          if (existing && (existing.time || 0) >= (entry.time || 0)) {
+            continue;
+          }
+          if (!existing && this.cache.size >= this.maxSize) {
+            continue;
+          }
+          this.cache.set(entry.key, {
+            sourceKey: entry.sourceKey,
+            sourceName: entry.sourceName || entry.sourceKey,
+            isFallback: !!entry.isFallback,
+            item: entry.item,
+            time: entry.time || loadedAt,
+          });
+        }
+      }
+    } catch (e) {}
   }
 
   _loadFromDisk() {
@@ -659,43 +861,75 @@ class MatchCacheManager {
       if (!ls) return;
       const raw = ls.getItem(CACHE_STORAGE_KEY);
       if (raw) {
-        const list = JSON.parse(raw);
-        if (Array.isArray(list)) {
-          const now = Date.now();
-          for (const entry of list) {
-            if (
-              entry &&
-              entry.key &&
-              entry.sourceKey &&
-              entry.item &&
-              now - (entry.time || 0) <= this.ttlMs
-            ) {
-              this.cache.set(entry.key, {
-                sourceKey: entry.sourceKey,
-                item: entry.item,
-                time: entry.time || now,
-              });
-            }
-          }
-        }
+        this._hydrateList(raw);
       }
+    } catch (e) {}
+  }
+
+  async _initNativeStorage() {
+    try {
+      const mfStorage = getMusicFreeNativeStorage();
+      if (!mfStorage) {
+        this._nativeReady = true;
+        return;
+      }
+      const raw = await mfStorage.getItem(CACHE_STORAGE_KEY);
+      if (raw) {
+        this._hydrateList(raw);
+      }
+    } catch (e) {
+    } finally {
+      this._nativeReady = true;
+    }
+  }
+
+  /**
+   * 异步等待桌面端原生磁盘缓存就绪（冷启动首拍最多等待 maxWaitMs，不影响响应速度）
+   */
+  async ensureReady(maxWaitMs = 50) {
+    if (this._nativeReady || !this._initPromise) return;
+    try {
+      await Promise.race([
+        this._initPromise,
+        new Promise((resolve) => setTimeout(resolve, maxWaitMs)),
+      ]);
     } catch (e) {}
   }
 
   _saveToDisk() {
     try {
+      const entries = Array.from(this.cache.entries()).slice(-MAX_PERSISTED_CACHE_ENTRIES);
+      const list = entries.map(([key, entry]) => ({
+        key,
+        sourceKey: entry.sourceKey,
+        sourceName: entry.sourceName || entry.sourceKey,
+        isFallback: !!entry.isFallback,
+        item: entry.item,
+        time: entry.time,
+      }));
+      const payload = JSON.stringify(list);
+      this._lastRawLength = payload.length;
+
       const ls = getLocalStorageSafe();
-      if (!ls) return;
-      const list = [];
-      for (const [key, entry] of this.cache.entries()) {
-        list.push({
-          key,
-          sourceKey: entry.sourceKey,
-          item: entry.item,
-          time: entry.time,
-        });
+      if (ls) {
+        try {
+          ls.setItem(CACHE_STORAGE_KEY, payload);
+        } catch (e) {}
       }
-      ls.setItem(CACHE_STORAGE_KEY, JSON.stringify(list));
+
+      const mfStorage = getMusicFreeNativeStorage();
+      if (mfStorage) {
+        Promise.resolve(mfStorage.setItem(CACHE_STORAGE_KEY, payload))
+          .then(() => {
+            this._quotaExceeded = false;
+          })
+          .catch((e) => {
+            const msg = String(e?.message || "").toLowerCase();
+            if (msg.includes("exceeds limit") || msg.includes("quota")) {
+              this._quotaExceeded = true;
+            }
+          });
+      }
     } catch (e) {}
   }
 
@@ -707,9 +941,9 @@ class MatchCacheManager {
     if (!key || !this.cache.has(key)) return null;
 
     const entry = this.cache.get(key);
-    // 检查是否过期
     if (Date.now() - entry.time > this.ttlMs) {
       this.cache.delete(key);
+      this._tombstones.add(key);
       this._saveToDisk();
       return null;
     }
@@ -724,19 +958,22 @@ class MatchCacheManager {
    * 记录成功的换源记忆
    * 注意：我们记忆的是【目标源与目标曲目元数据/ID】，而不是具有临时 Token 的音频 URL
    */
-  set(title, artist, sourceKey, matchedItem) {
+  set(title, artist, sourceKey, matchedItem, sourceName = "", isFallback = false) {
     const key = this._getKey(title, artist);
     if (!key) return;
 
-    if (this.cache.size >= this.maxSize) {
-      // 淘汰最久未使用的首个元素
+    this._tombstones.delete(key);
+    if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
       const oldestKey = this.cache.keys().next().value;
       this.cache.delete(oldestKey);
     }
 
+    this.cache.delete(key);
     this.cache.set(key, {
       sourceKey,
-      item: matchedItem,
+      sourceName: sourceName || sourceKey,
+      isFallback: !!isFallback,
+      item: compactMatchedItem(matchedItem),
       time: Date.now(),
     });
 
@@ -748,9 +985,12 @@ class MatchCacheManager {
    */
   invalidate(title, artist) {
     const key = this._getKey(title, artist);
-    if (key && this.cache.has(key)) {
-      this.cache.delete(key);
-      this._saveToDisk();
+    if (key) {
+      this._tombstones.add(key);
+      if (this.cache.has(key)) {
+        this.cache.delete(key);
+        this._saveToDisk();
+      }
     }
   }
 
@@ -759,11 +999,20 @@ class MatchCacheManager {
    */
   clear() {
     this.cache.clear();
+    this._tombstones.clear();
+    this._clearedAt = Date.now();
+    this._lastRawLength = 0;
+
     const ls = getLocalStorageSafe();
     if (ls) {
       try {
         ls.removeItem(CACHE_STORAGE_KEY);
       } catch (e) {}
+    }
+
+    const mfStorage = getMusicFreeNativeStorage();
+    if (mfStorage) {
+      Promise.resolve(mfStorage.removeItem(CACHE_STORAGE_KEY)).catch(() => {});
     }
   }
 
@@ -772,7 +1021,7 @@ class MatchCacheManager {
    */
   getStats() {
     const ls = getLocalStorageSafe();
-    let rawSize = 0;
+    let rawSize = this._lastRawLength || 0;
     if (ls) {
       try {
         const raw = ls.getItem(CACHE_STORAGE_KEY);
@@ -798,6 +1047,644 @@ module.exports = {
   matchCache,
   MatchCacheManager,
   CACHE_STORAGE_KEY,
+};
+
+  },
+  "./core/playback-session": function(module, exports, require, env, getUserVariables, __musicfree_require) {
+"use strict";
+
+const { cleanTitle, cleanArtist } = require("./matcher");
+const { matchCache } = require("./cache");
+const { getLocalStorageSafe, getMusicFreeNativeStorage } = require("./storage");
+
+const SESSION_STORAGE_KEY = "mf_playback_session_v1";
+const SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时会话有效期，覆盖超长曲目与暂停恢复
+const MAX_SESSIONS = 200;
+const MAX_PERSISTED_SESSIONS = 60;
+
+const SOURCE_DISPLAY_NAME_MAP = {
+  netease: "网易云音乐",
+  qq: "QQ音乐",
+  kuwo: "酷我音乐",
+  kugou: "酷狗音乐",
+  migu: "咪咕音乐",
+  bilibili: "B站音频",
+  gdstudio: "GD音乐台",
+  fivesing: "5sing原创",
+  ximalaya: "喜马拉雅",
+};
+
+const SOURCE_TAG_STRIP_RE =
+  /^\[[\d:.]+\]\s*🎵\s*(?:播放)?音源[：:][^\r\n]*(?:\r?\n|$)/gm;
+const FIRST_TIMESTAMP_RE = /\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]/;
+const CREDIT_OR_BANNER_RE =
+  /(?:作词|作曲|编曲|制作人|演唱|原唱|混音|母带|监制|策划|统筹|出品|纯音乐|暂无歌词|lyricist|composer|arranger|producer|produced\s+by|written\s+by|lyrics\s+by|music\s+by|vocals|(?:^|\s)词\s*[:：]|(?:^|\s)曲\s*[:：]|\s-\s)/i;
+
+function normalizeTrackName(title, fallbackRaw = "") {
+  if (!title && !fallbackRaw) return "";
+  const cleaned = cleanTitle(String(title || "")).toLowerCase().trim();
+  if (cleaned) return cleaned;
+  return String(title || fallbackRaw || "").toLowerCase().trim();
+}
+
+function normalizeArtistName(artist) {
+  if (!artist || typeof artist !== "string") return "";
+  return cleanArtist(artist).toLowerCase().trim();
+}
+
+function isArtistCompatible(a1, a2) {
+  const n1 = normalizeArtistName(a1);
+  const n2 = normalizeArtistName(a2);
+  if (!n1 || !n2) return true;
+  if (n1 === n2) return true;
+
+  const t1 = n1.split(/\s+/).filter(Boolean);
+  const t2 = new Set(n2.split(/\s+/).filter(Boolean));
+  for (const tok of t1) {
+    if ((tok.length >= 2 || (n1.length === 1 && n2.length === 1)) && t2.has(tok)) {
+      return true;
+    }
+  }
+
+  if (Math.min(n1.length, n2.length) >= 2 && (n1.includes(n2) || n2.includes(n1))) {
+    return true;
+  }
+  return false;
+}
+
+function isTrackMatch(aTitle, aArtist, bTitle, bArtist) {
+  const t1 = normalizeTrackName(aTitle);
+  const t2 = normalizeTrackName(bTitle);
+  if (!t1 || !t2) return false;
+  return t1 === t2 && isArtistCompatible(aArtist, bArtist);
+}
+
+function parseTimestampSec(minStr, secStr, fracStr) {
+  const min = parseInt(minStr, 10) || 0;
+  const sec = parseInt(secStr, 10) || 0;
+  let frac = 0;
+  if (fracStr) {
+    frac = parseInt(fracStr, 10) / Math.pow(10, fracStr.length);
+  }
+  return min * 60 + sec + frac;
+}
+
+/**
+ * 实时播放会话管理器
+ * 负责精准追踪实际出声播放源，支持桌面端/移动端持久化与 LRC 头部安全注入
+ */
+class PlaybackSessionManager {
+  constructor() {
+    this.sessions = new Map();
+    this.waiters = new Map();
+    this.resolvingCounts = new Map();
+    this.currentPlayback = null;
+    this._nativeReady = false;
+    this._loadSync();
+    this._initPromise = this._initNativeStorage();
+  }
+
+  markResolving(title, artist) {
+    const exactKey = this._getExactKey(title, artist);
+    const normTitle = normalizeTrackName(title);
+    if (exactKey) {
+      this.resolvingCounts.set(exactKey, (this.resolvingCounts.get(exactKey) || 0) + 1);
+    }
+    if (normTitle && normTitle !== exactKey) {
+      const cur = this.resolvingCounts.get(normTitle);
+      if (Array.isArray(cur)) {
+        cur.push(artist || "");
+      } else {
+        this.resolvingCounts.set(normTitle, [artist || ""]);
+      }
+    }
+  }
+
+  unmarkResolving(title, artist) {
+    const exactKey = this._getExactKey(title, artist);
+    const normTitle = normalizeTrackName(title);
+    if (exactKey && this.resolvingCounts.has(exactKey)) {
+      const next = (this.resolvingCounts.get(exactKey) || 0) - 1;
+      if (next <= 0) this.resolvingCounts.delete(exactKey);
+      else this.resolvingCounts.set(exactKey, next);
+    }
+    if (normTitle && normTitle !== exactKey && this.resolvingCounts.has(normTitle)) {
+      const arr = this.resolvingCounts.get(normTitle);
+      if (Array.isArray(arr)) {
+        const idx = arr.indexOf(artist || "");
+        if (idx !== -1) arr.splice(idx, 1);
+        if (arr.length === 0) this.resolvingCounts.delete(normTitle);
+      }
+    }
+
+    // 同一歌曲全部并发解析任务结束后，立即按已有会话或默认音源唤醒等待中的歌词请求，无需空耗超时等待
+    if (!this.isResolving(title, artist)) {
+      this._flushResolvedWaiters(title, artist, exactKey, normTitle);
+    }
+  }
+
+  _findMatchingOrCurrentSession(title, artist) {
+    const lateSession = this._findMatchingSession(title, artist);
+    if (lateSession) return lateSession;
+    if (
+      this.currentPlayback &&
+      Date.now() - this.currentPlayback.time <= SESSION_TTL_MS &&
+      isTrackMatch(title, artist, this.currentPlayback.title, this.currentPlayback.artist)
+    ) {
+      return this.currentPlayback;
+    }
+    return null;
+  }
+
+  _removeWaiter(waiter) {
+    if (!waiter || !Array.isArray(waiter.registerKeys)) return;
+    for (const k of waiter.registerKeys) {
+      if (!this.waiters.has(k)) continue;
+      const arr = this.waiters.get(k).filter((w) => w !== waiter);
+      if (arr.length === 0) this.waiters.delete(k);
+      else this.waiters.set(k, arr);
+    }
+  }
+
+  _flushResolvedWaiters(title, artist, exactKey, normTitle) {
+    const toWake = new Set();
+    if (exactKey && this.waiters.has(exactKey)) {
+      for (const w of this.waiters.get(exactKey)) {
+        toWake.add(w);
+      }
+    }
+    if (normTitle && this.waiters.has(normTitle)) {
+      for (const w of this.waiters.get(normTitle)) {
+        if (isArtistCompatible(w.artist, artist) && !this.isResolving(w.title, w.artist)) {
+          toWake.add(w);
+        }
+      }
+    }
+    for (const w of toWake) {
+      this._removeWaiter(w);
+      const fallback = this._findMatchingOrCurrentSession(w.title, w.artist) || w.defaultResult || null;
+      try {
+        w.resolve(fallback);
+      } catch (e) {}
+    }
+  }
+
+  isResolving(title, artist) {
+    const exactKey = this._getExactKey(title, artist);
+    if (exactKey && (this.resolvingCounts.get(exactKey) || 0) > 0) return true;
+    const normTitle = normalizeTrackName(title);
+    if (normTitle && this.resolvingCounts.has(normTitle)) {
+      const arr = this.resolvingCounts.get(normTitle);
+      if (Array.isArray(arr)) {
+        return arr.some((a) => isArtistCompatible(artist, a));
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 归一化音源展示名称（将内部英文 key 映射为标准可读中文平台名，并过滤聚合自身占位名）
+   */
+  formatSourceName(rawName) {
+    if (!rawName || typeof rawName !== "string") return "";
+    const trimmed = rawName.trim();
+    if (!trimmed || trimmed === "智能多源聚合") return "";
+    const lower = trimmed.toLowerCase();
+    return SOURCE_DISPLAY_NAME_MAP[lower] || trimmed;
+  }
+
+  _getExactKey(title, artist) {
+    const t = normalizeTrackName(title);
+    if (!t) return "";
+    const a = normalizeArtistName(artist);
+    return `${t}___${a}`;
+  }
+
+  _hydrateSnapshot(raw) {
+    if (!raw || typeof raw !== "string") return;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return;
+      const now = Date.now();
+
+      if (Array.isArray(parsed.sessions)) {
+        for (const item of parsed.sessions) {
+          if (
+            item &&
+            item.key &&
+            item.info &&
+            item.info.sourceName &&
+            now - (item.info.time || 0) <= SESSION_TTL_MS
+          ) {
+            const existing = this.sessions.get(item.key);
+            if (!existing || (item.info.time || 0) > (existing.time || 0)) {
+              this.sessions.set(item.key, item.info);
+            }
+          }
+        }
+      }
+
+      if (
+        !this.currentPlayback &&
+        parsed.currentPlayback &&
+        parsed.currentPlayback.sourceName &&
+        now - (parsed.currentPlayback.time || 0) <= SESSION_TTL_MS
+      ) {
+        this.currentPlayback = parsed.currentPlayback;
+      }
+    } catch (e) {}
+  }
+
+  _loadSync() {
+    const ls = getLocalStorageSafe();
+    if (!ls) return;
+    try {
+      this._hydrateSnapshot(ls.getItem(SESSION_STORAGE_KEY));
+    } catch (e) {}
+  }
+
+  async _initNativeStorage() {
+    try {
+      const mfStorage = getMusicFreeNativeStorage();
+      if (!mfStorage) {
+        this._nativeReady = true;
+        return;
+      }
+      const raw = await mfStorage.getItem(SESSION_STORAGE_KEY);
+      if (raw) this._hydrateSnapshot(raw);
+    } catch (e) {
+    } finally {
+      this._nativeReady = true;
+    }
+  }
+
+  async ensureReady(maxWaitMs = 40) {
+    if (this._nativeReady || !this._initPromise) return;
+    try {
+      await Promise.race([
+        this._initPromise,
+        new Promise((resolve) => setTimeout(resolve, maxWaitMs)),
+      ]);
+    } catch (e) {}
+  }
+
+  _persistSnapshot() {
+    try {
+      const entries = Array.from(this.sessions.entries()).slice(-MAX_PERSISTED_SESSIONS);
+      const payload = JSON.stringify({
+        currentPlayback: this.currentPlayback,
+        sessions: entries.map(([key, info]) => ({ key, info })),
+      });
+
+      const ls = getLocalStorageSafe();
+      if (ls) {
+        try {
+          ls.setItem(SESSION_STORAGE_KEY, payload);
+        } catch (e) {}
+      }
+
+      const mfStorage = getMusicFreeNativeStorage();
+      if (mfStorage) {
+        Promise.resolve(mfStorage.setItem(SESSION_STORAGE_KEY, payload)).catch(() => {});
+      }
+    } catch (e) {}
+  }
+
+  _findMatchingSession(title, artist) {
+    const now = Date.now();
+    const exactKey = this._getExactKey(title, artist);
+    if (exactKey && this.sessions.has(exactKey)) {
+      const hit = this.sessions.get(exactKey);
+      if (now - hit.time <= SESSION_TTL_MS) return hit;
+    }
+
+    const normTitle = normalizeTrackName(title);
+    if (!normTitle) return null;
+
+    // 反向遍历优先命中最新记录，并强制要求歌手兼容，防止同名不同歌手串台
+    const entries = Array.from(this.sessions.values());
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const item = entries[i];
+      if (now - item.time > SESSION_TTL_MS) continue;
+      if (item.normTitle === normTitle && isArtistCompatible(artist, item.artist)) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 记录已成功获取到播放链接的活动曲目音源
+   */
+  recordActiveSession(title, artist, sourceName, isFallback = false) {
+    const formattedSource = this.formatSourceName(sourceName);
+    if (!title || !formattedSource) return;
+
+    const normTitle = normalizeTrackName(title);
+    const normArtist = normalizeArtistName(artist);
+    const exactKey = this._getExactKey(title, artist);
+
+    const info = {
+      title,
+      artist: artist || "",
+      normTitle,
+      normArtist,
+      sourceName: formattedSource,
+      isFallback: !!isFallback,
+      time: Date.now(),
+    };
+
+    if (exactKey) {
+      this.sessions.delete(exactKey);
+      this.sessions.set(exactKey, info);
+    }
+    this.currentPlayback = info;
+
+    // 唤醒匹配等待队列：精准键直接唤醒，纯歌名键须校验歌手兼容后唤醒
+    if (exactKey && this.waiters.has(exactKey)) {
+      const cbs = this.waiters.get(exactKey);
+      this.waiters.delete(exactKey);
+      cbs.forEach((w) => {
+        try {
+          w.resolve(info);
+        } catch (e) {}
+      });
+    }
+
+    if (normTitle && normTitle !== exactKey && this.waiters.has(normTitle)) {
+      const list = this.waiters.get(normTitle);
+      const remaining = [];
+      list.forEach((w) => {
+        if (isArtistCompatible(w.artist, artist)) {
+          try {
+            w.resolve(info);
+          } catch (e) {}
+        } else {
+          remaining.push(w);
+        }
+      });
+      if (remaining.length === 0) this.waiters.delete(normTitle);
+      else this.waiters.set(normTitle, remaining);
+    }
+
+    // 超容量时按 LRU 与过期时间裁剪
+    if (this.sessions.size > MAX_SESSIONS) {
+      const now = Date.now();
+      for (const [k, v] of this.sessions.entries()) {
+        if (now - v.time > SESSION_TTL_MS || this.sessions.size > MAX_SESSIONS) {
+          this.sessions.delete(k);
+        }
+      }
+    }
+
+    this._persistSnapshot();
+  }
+
+  /**
+   * 获取或等待当前播放歌曲的实际音源信息（零串源、抗切换歌词污染、超时熔断）
+   */
+  async getOrWaitSource(
+    title,
+    artist,
+    defaultSourceName = "",
+    timeoutMs = 600,
+    isLyricSearch = false,
+    options = {}
+  ) {
+    await Promise.all([this.ensureReady(40), matchCache.ensureReady(40)]);
+    const now = Date.now();
+
+    // 模式 A：用户在弹窗搜索/切换关联歌词
+    // 必须严格绑定当前真实正在出声的 currentPlayback，绝不能被所点歌词条目的歌名/历史缓存污染！
+    if (isLyricSearch) {
+      if (this.currentPlayback && now - this.currentPlayback.time <= SESSION_TTL_MS) {
+        return this.currentPlayback;
+      }
+      const fallbackMatch = this._findMatchingSession(title, artist);
+      if (fallbackMatch) return fallbackMatch;
+
+      const cached = matchCache.get(title, artist);
+      if (cached && (cached.sourceName || cached.sourceKey)) {
+        return {
+          sourceName: this.formatSourceName(cached.sourceName || cached.sourceKey),
+          isFallback: !!cached.isFallback,
+          time: cached.time,
+        };
+      }
+      return null;
+    }
+
+    // 模式 B：常规切歌/播放读取歌词
+    // 1. 先查当前活跃播放（严格歌名+歌手校验，防止上一首歌污染下一首）
+    if (
+      this.currentPlayback &&
+      now - this.currentPlayback.time <= SESSION_TTL_MS &&
+      isTrackMatch(title, artist, this.currentPlayback.title, this.currentPlayback.artist)
+    ) {
+      return this.currentPlayback;
+    }
+
+    // 2. 查内存及持久化会话表（含同名且歌手兼容的规范化匹配）
+    const matchedSession = this._findMatchingSession(title, artist);
+    if (matchedSession) {
+      return matchedSession;
+    }
+
+    // 3. 查持久化秒开记忆表
+    const cached = matchCache.get(title, artist);
+    if (cached && (cached.sourceName || cached.sourceKey)) {
+      const sName = this.formatSourceName(cached.sourceName || cached.sourceKey);
+      if (sName) {
+        return {
+          sourceName: sName,
+          isFallback: !!cached.isFallback,
+          time: cached.time,
+        };
+      }
+    }
+
+    // 4. 并发等待正在执行的 getMediaSource 取链完成（若仅命中缓存音频未触发 getMediaSource，可由 waitOnlyIfResolving 立即放行 0ms 返回）
+    const exactKey = this._getExactKey(title, artist);
+    const normTitle = normalizeTrackName(title);
+    const formattedDefault = this.formatSourceName(defaultSourceName);
+
+    if (options && options.waitOnlyIfResolving && !this.isResolving(title, artist)) {
+      return formattedDefault ? { sourceName: formattedDefault, isFallback: false } : null;
+    }
+
+    return new Promise((resolve) => {
+      let timer = null;
+      const defaultResult = formattedDefault
+        ? { sourceName: formattedDefault, isFallback: false }
+        : null;
+      const registerKeys = [];
+      if (exactKey) registerKeys.push(exactKey);
+      if (normTitle && normTitle !== exactKey) registerKeys.push(normTitle);
+
+      if (registerKeys.length === 0) {
+        resolve(defaultResult);
+        return;
+      }
+
+      const waiter = {
+        title,
+        artist: artist || "",
+        registerKeys,
+        defaultResult,
+        resolve: (info) => {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          resolve(info);
+        },
+      };
+
+      timer = setTimeout(() => {
+        this._removeWaiter(waiter);
+        // 超时后仅在确认歌名歌手匹配时采纳会话，严禁把上一首歌的 currentPlayback 张冠李戴到当前曲目
+        resolve(this._findMatchingOrCurrentSession(title, artist) || defaultResult);
+      }, timeoutMs);
+
+      for (const k of registerKeys) {
+        if (!this.waiters.has(k)) this.waiters.set(k, []);
+        this.waiters.get(k).push(waiter);
+      }
+    });
+  }
+
+  /**
+   * 将 [00:00.00] 音源提示安全注入 LRC：
+   * 1. 保留原有 [ti:]/[ar:]/[al:]/[offset:] 等 LRC 元数据头在最前面；
+   * 2. 自动识别开头连续的 00:00.00 署名/标题/说明行（跳过夹杂的空行），整体微调至安全间隙内，确保桌面歌词与高亮不被跳过且绝不改动演唱行与翻译对齐；
+   * 3. 关闭开关或更新时可幂等清理旧标记。
+   */
+  injectSourceTagToLrc(lrcRes, sourceInfo, enabled = true, trackTitle = "") {
+    const baseRes = lrcRes && typeof lrcRes === "object" ? lrcRes : { rawLrc: "" };
+    const cleanedRaw = String(baseRes.rawLrc || "").replace(SOURCE_TAG_STRIP_RE, "");
+    const formattedName = sourceInfo ? this.formatSourceName(sourceInfo.sourceName) : "";
+
+    if (!enabled || !formattedName) {
+      return {
+        ...baseRes,
+        rawLrc: cleanedRaw,
+      };
+    }
+
+    const tag = sourceInfo.isFallback
+      ? `[00:00.00] 🎵 播放音源：${formattedName} (容灾换源)`
+      : `[00:00.00] 🎵 播放音源：${formattedName}`;
+
+    if (!cleanedRaw.trim()) {
+      return {
+        ...baseRes,
+        rawLrc: `${tag}\n[00:01.00] 纯音乐 / 暂无歌词\n`,
+      };
+    }
+
+    // 拆分 LRC 前置元数据标签 ([ti:...] [ar:...] [offset:...] 等) 与正文时间戳行
+    const firstTsMatch = FIRST_TIMESTAMP_RE.exec(cleanedRaw);
+    let metaHeader = "";
+    let body = cleanedRaw;
+    if (firstTsMatch) {
+      const splitIdx = firstTsMatch.index;
+      metaHeader = cleanedRaw.slice(0, splitIdx);
+      body = cleanedRaw.slice(splitIdx);
+    }
+
+    // 处理开头连续 00:00.00（含夹杂空行）的桌面歌词高亮避让
+    const hasZeroTranslation = /^\[0{1,2}:0{2}(?:[.:]0+)?\]/m.test(
+      String(baseRes.translation || "")
+    );
+    if (!hasZeroTranslation) {
+      const lines = body.split(/\r?\n/);
+      const zeroLineIndices = [];
+      let tNext = null;
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) {
+          if (zeroLineIndices.length > 0) continue;
+          break;
+        }
+        const m = /^(\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\])(.*)$/.exec(line);
+        if (!m) break;
+        const sec = parseTimestampSec(m[2], m[3], m[4]);
+        if (sec === 0) {
+          zeroLineIndices.push({ index: i, tag: m[1], text: m[5] || "" });
+        } else {
+          tNext = sec;
+          break;
+        }
+      }
+
+      if (zeroLineIndices.length > 0) {
+        const cleanTargetTitle = trackTitle ? cleanTitle(trackTitle).toLowerCase().trim() : "";
+        const nonEmptyZeroLines = zeroLineIndices.filter((z) => z.text.trim().length > 0);
+        const isCreditOrBannerLine = (text) => {
+          if (CREDIT_OR_BANNER_RE.test(text)) return true;
+          if (!cleanTargetTitle) return false;
+          const cleanLine = cleanTitle(text).toLowerCase().trim();
+          const rawLower = text.toLowerCase().trim();
+          return (
+            cleanLine === cleanTargetTitle ||
+            (cleanTargetTitle.length >= 2 && rawLower.includes(cleanTargetTitle))
+          );
+        };
+
+        const effectiveNext = tNext !== null ? tNext : 1.0;
+        if (nonEmptyZeroLines.length === 0) {
+          const zeroIdxSet = new Set(zeroLineIndices.map((z) => z.index));
+          const filteredBody = lines.filter((_, idx) => !zeroIdxSet.has(idx)).join("\n");
+          if (!filteredBody.trim()) {
+            return {
+              ...baseRes,
+              rawLrc: `${metaHeader && !metaHeader.endsWith("\n") ? `${metaHeader}\n` : metaHeader}${tag}\n[00:01.00] 纯音乐 / 暂无歌词\n`,
+            };
+          }
+          body = filteredBody;
+        } else {
+          const canShift =
+            nonEmptyZeroLines.every((z) => isCreditOrBannerLine(z.text)) &&
+            effectiveNext >= 0.06;
+
+          if (canShift) {
+            const maxTargetCs = Math.min(
+              45,
+              Math.max(3, Math.floor((effectiveNext * 100) / 2))
+            );
+            const count = zeroLineIndices.length;
+            for (let j = 0; j < count; j++) {
+              const z = zeroLineIndices[j];
+              const cs = Math.min(
+                maxTargetCs,
+                Math.max(3, Math.floor(((j + 1) * maxTargetCs) / count))
+              );
+              const bumpedTag = `[00:00.${String(cs).padStart(2, "0")}]`;
+              lines[z.index] = bumpedTag + z.text;
+            }
+            body = lines.join("\n");
+          }
+        }
+      }
+    }
+
+    const prefix = metaHeader && !metaHeader.endsWith("\n") ? `${metaHeader}\n` : metaHeader;
+    return {
+      ...baseRes,
+      rawLrc: `${prefix}${tag}\n${body}`,
+    };
+  }
+}
+
+const playbackSession = new PlaybackSessionManager();
+
+module.exports = {
+  playbackSession,
+  PlaybackSessionManager,
+  isTrackMatch,
+  isArtistCompatible,
+  SESSION_TTL_MS,
 };
 
   },
@@ -827,6 +1714,11 @@ const nativeStorageCache = new Map();
 let isNativeStorageInit = false;
 let nativeStorageInitPromise = null;
 let lastInheritInfo = null;
+let quotaStatus = { exceeded: false, lastError: "" };
+
+function getQuotaStatus() {
+  return { ...quotaStatus };
+}
 
 /**
  * 在 Electron 桌面端安全探测 Node.js 原生 fs 模块 (具备沙箱穿透与全局降级容错)
@@ -1333,8 +2225,24 @@ async function savePluginsAsync(list) {
       const jsonStr = JSON.stringify(mergedList);
       nativeStorageCache.set(STORAGE_KEY, jsonStr);
       await mfStorage.setItem(STORAGE_KEY, jsonStr);
+      quotaStatus = { exceeded: false, lastError: "" };
     } catch (e) {
-      console.warn("[Storage] 写入 MusicFree 原生磁盘存储失败:", e.message);
+      const msg = String(e?.message || "");
+      if (msg.toLowerCase().includes("exceeds limit") || msg.toLowerCase().includes("quota")) {
+        quotaStatus = { exceeded: true, lastError: msg };
+        // 若共享 chunk.json 接近 10MB 上限，尝试降级保存精简核心音源子集，保证基础冷启动可用
+        try {
+          const compactSubset = inMemoryStore
+            .slice()
+            .filter((p) => p && p.code && p.code.length <= 40000)
+            .slice(0, 12);
+          if (compactSubset.length > 0 && compactSubset.length < inMemoryStore.length) {
+            await mfStorage.setItem(STORAGE_KEY, JSON.stringify(compactSubset));
+          }
+        } catch (compactErr) {}
+      } else {
+        console.warn("[Storage] 写入 MusicFree 原生磁盘存储失败:", msg);
+      }
     }
   }
 
@@ -1582,6 +2490,7 @@ module.exports = {
   STORAGE_INITIALIZED_KEY,
   STORAGE_TOMBSTONE_KEY,
   getInheritInfo,
+  getQuotaStatus,
   tryInheritFromPreviousVersions,
   getGlobalNodeFs,
   addTombstone,
@@ -2075,17 +2984,120 @@ function registerSingleEvaluatedPlugin(
   };
 }
 
+function resetDiagnosticLogs() {
+  syncDiagnosticLogs.lastSyncTime = 0;
+  syncDiagnosticLogs.lastSyncStatus = "syncing";
+  syncDiagnosticLogs.lastSyncError = null;
+  syncDiagnosticLogs.totalSubPlugins = 0;
+  syncDiagnosticLogs.successCount = 0;
+  syncDiagnosticLogs.failCount = 0;
+  syncDiagnosticLogs.failedPlugins = [];
+}
+
+function finalizeDiagnosticLogs(totalCount, successCount, failCount, lastErr = null) {
+  syncDiagnosticLogs.lastSyncTime = Date.now();
+  syncDiagnosticLogs.totalSubPlugins = totalCount;
+  syncDiagnosticLogs.successCount = successCount;
+  syncDiagnosticLogs.failCount = failCount;
+  syncDiagnosticLogs.lastSyncError = lastErr;
+  if (failCount === 0) {
+    syncDiagnosticLogs.lastSyncStatus = "success";
+  } else if (successCount > 0) {
+    syncDiagnosticLogs.lastSyncStatus = "partial";
+  } else {
+    syncDiagnosticLogs.lastSyncStatus = "error";
+  }
+}
+
+function aggregateSyncDiagnostics(results = []) {
+  let totalCount = 0;
+  let successCount = 0;
+  let failCount = 0;
+  let lastErrorMsg = null;
+
+  results.forEach((item) => {
+    const val = item && ("status" in item && (item.status === "fulfilled" || item.status === "rejected"))
+      ? (item.status === "fulfilled" ? item.value : { status: "error", message: "更新失败" })
+      : item;
+    if (!val) {
+      totalCount += 1;
+      failCount += 1;
+      return;
+    }
+    if (val._syncCounts) {
+      totalCount += val._syncCounts.total;
+      successCount += val._syncCounts.success;
+      failCount += val._syncCounts.fail;
+    } else {
+      totalCount += 1;
+      if (val.status === "error") {
+        failCount += 1;
+        lastErrorMsg = val.message || lastErrorMsg;
+      } else {
+        successCount += 1;
+      }
+    }
+  });
+
+  finalizeDiagnosticLogs(totalCount, successCount, failCount, lastErrorMsg);
+}
+
+/**
+ * 批量从插件配置列表导入并汇总单次诊断日志
+ */
+async function registerPluginBatch(items = [], tier = "tier0", builtInSourcesMap = {}) {
+  const validUrls = (Array.isArray(items) ? items : [])
+    .map((it) => (it && typeof it.url === "string" ? it.url.trim() : ""))
+    .filter((u) => u.startsWith("http"));
+
+  if (validUrls.length === 0) {
+    return { addedCount: 0, results: [] };
+  }
+
+  resetDiagnosticLogs();
+  const results = [];
+  let addedCount = 0;
+  for (const url of validUrls) {
+    const r = await registerOrUpdatePlugin(url, tier, builtInSourcesMap, { resetLogs: false });
+    results.push(r);
+    if (r && (r.status === "added" || r.status === "updated")) {
+      addedCount++;
+    }
+  }
+  aggregateSyncDiagnostics(results);
+  return { addedCount, results };
+}
+
 /**
  * 注册或更新单个或批量插件 (支持 .js 脚本 与 .json 订阅合集)
  */
-async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {}) {
+async function registerOrUpdatePlugin(
+  url,
+  tier = "tier0",
+  builtInSourcesMap = {},
+  options = {}
+) {
+  const { resetLogs = true } = options || {};
+  if (resetLogs) {
+    resetDiagnosticLogs();
+  }
+
   if (!url || typeof url !== "string" || !url.startsWith("http")) {
-    return {
+    const errRes = {
       status: "error",
       name: "未知",
       version: "0.0.0",
       message: "无效的插件 URL 链接",
     };
+    if (resetLogs) {
+      syncDiagnosticLogs.failedPlugins.push({
+        name: errRes.name,
+        url: String(url || ""),
+        reason: errRes.message,
+      });
+      finalizeDiagnosticLogs(1, 0, 1, errRes.message);
+    }
+    return errRes;
   }
 
   const cleanUrl = url.trim();
@@ -2127,7 +3139,8 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
         return true;
       });
 
-      // 8 路并发高速拉取子插件 (集中批处理写入，杜绝并发覆灭)
+      // 8 路并发高速拉取子插件，完成后严格按订阅列表原有优先级顺序注册（杜绝乱序抢占 Chunk 0）
+      let subFailCount = 0;
       const tasks = validItems.map(async (item) => {
         const itemUrl = item.url || item.srcUrl;
         try {
@@ -2140,24 +3153,23 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
           const rawSubCode = typeof subRes.data === "string" ? subRes.data : JSON.stringify(subRes.data);
           const plugin = evaluatePluginCode(rawSubCode);
           if (plugin) {
-            return registerSingleEvaluatedPlugin(
-              plugin,
-              itemUrl,
-              tier,
-              builtInSourcesMap,
-              rawSubCode,
-              true // skipPersist: 批处理完成后统一保存
-            );
+            return { ok: true, itemUrl, plugin, rawSubCode };
           }
+          return {
+            ok: false,
+            name: item.name || "未知",
+            url: itemUrl,
+            reason: "代码不符合 MusicFree 插件协议",
+          };
         } catch (subErr) {
           console.warn(`[PluginDownload] 音源 [${item.name || itemUrl}] 下载或解析失败:`, subErr.message);
-          syncDiagnosticLogs.failedPlugins.push({
+          return {
+            ok: false,
             name: item.name || "未知",
             url: itemUrl,
             reason: subErr.message,
-          });
+          };
         }
-        return null;
       });
 
       const subResults = await Promise.allSettled(tasks);
@@ -2168,11 +3180,30 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
 
       subResults.forEach((r) => {
         if (r.status === "fulfilled" && r.value) {
-          const singleRes = r.value;
-          if (singleRes.status === "added") addedCount++;
-          if (singleRes.status === "updated") updatedCount++;
-          if (singleRes.status === "exists") existsCount++;
-          subReports.push(singleRes);
+          const v = r.value;
+          if (v.ok) {
+            const singleRes = registerSingleEvaluatedPlugin(
+              v.plugin,
+              v.itemUrl,
+              tier,
+              builtInSourcesMap,
+              v.rawSubCode,
+              true // skipPersist: 批处理完成后统一保存
+            );
+            if (singleRes.status === "added") addedCount++;
+            if (singleRes.status === "updated") updatedCount++;
+            if (singleRes.status === "exists") existsCount++;
+            subReports.push(singleRes);
+          } else {
+            subFailCount++;
+            syncDiagnosticLogs.failedPlugins.push({
+              name: v.name,
+              url: v.url,
+              reason: v.reason,
+            });
+          }
+        } else {
+          subFailCount++;
         }
       });
 
@@ -2185,12 +3216,22 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
       const contentStr = typeof rawData === "string" ? rawData : JSON.stringify(rawData);
       setStoredContentHash(cleanUrl, simpleHash(contentStr));
 
+      const subSuccessCount = addedCount + updatedCount + existsCount;
+      if (resetLogs) {
+        finalizeDiagnosticLogs(validItems.length, subSuccessCount, subFailCount, null);
+      }
+
       return {
         status: addedCount > 0 || updatedCount > 0 ? "added" : "exists",
         name: "插件合集订阅",
         version: `${validItems.length}个源`,
         message: `成功解析插件合集! 新增: ${addedCount} 个, 更新: ${updatedCount} 个, 已有: ${existsCount} 个`,
         subReports,
+        _syncCounts: {
+          total: validItems.length,
+          success: subSuccessCount,
+          fail: subFailCount,
+        },
       };
     }
 
@@ -2199,28 +3240,50 @@ async function registerOrUpdatePlugin(url, tier = "tier0", builtInSourcesMap = {
       typeof rawData === "string" ? rawData : JSON.stringify(rawData);
     const plugin = evaluatePluginCode(codeStr);
     if (!plugin) {
-      return {
+      const errRes = {
         status: "error",
         name: cleanUrl,
         version: "0.0.0",
         message: "代码格式不符合 MusicFree 插件协议",
       };
+      syncDiagnosticLogs.failedPlugins.push({
+        name: cleanUrl,
+        url: cleanUrl,
+        reason: errRes.message,
+      });
+      if (resetLogs) {
+        finalizeDiagnosticLogs(1, 0, 1, errRes.message);
+      }
+      return errRes;
     }
 
-    return registerSingleEvaluatedPlugin(
+    const singleRes = registerSingleEvaluatedPlugin(
       plugin,
       cleanUrl,
       tier,
       builtInSourcesMap,
       codeStr
     );
+    if (resetLogs) {
+      finalizeDiagnosticLogs(1, 1, 0, null);
+    }
+    return singleRes;
   } catch (err) {
-    return {
+    const errRes = {
       status: "error",
       name: cleanUrl,
       version: "0.0.0",
       message: `网络连接失败: ${err.message}`,
     };
+    syncDiagnosticLogs.failedPlugins.push({
+      name: cleanUrl,
+      url: cleanUrl,
+      reason: err.message,
+    });
+    if (resetLogs) {
+      finalizeDiagnosticLogs(1, 0, 1, err.message);
+    }
+    return errRes;
   }
 }
 
@@ -2233,6 +3296,12 @@ async function syncCustomPlugins(
   builtInSourcesMap = {}
 ) {
   const currentFingerprint = `${tier0UrlsStr || ""}###${tier3UrlsStr || ""}`;
+
+  // 0. 纯内存 0ms 瞬时快路径：避免高频调用 search/getMediaSource/getLyric 时反复等待存储 IPC
+  if (dynamicRegistry.size > 0 && currentFingerprint === lastSyncedFingerprint) {
+    return [];
+  }
+
   const savedFingerprint =
     (await getLastSyncedFingerprintAsync()) || getLastSyncedFingerprint();
 
@@ -2293,10 +3362,12 @@ async function syncCustomPlugins(
     return [];
   }
 
+  resetDiagnosticLogs();
   const tasks = allUrls.map((item) =>
-    registerOrUpdatePlugin(item.url, item.tier, builtInSourcesMap)
+    registerOrUpdatePlugin(item.url, item.tier, builtInSourcesMap, { resetLogs: false })
   );
   const results = await Promise.allSettled(tasks);
+  aggregateSyncDiagnostics(results);
 
   // 4. 只有在至少成功拉取到音源时，才持久化记录指纹，防止断网导致“永久断更”
   const hasSuccess = results.some(
@@ -2315,16 +3386,22 @@ async function syncCustomPlugins(
  */
 async function updateAllRegisteredPlugins(builtInSourcesMap = {}) {
   const entries = Array.from(dynamicRegistry.entries());
+  if (entries.length === 0) return [];
+  resetDiagnosticLogs();
   const tasks = entries.map(([url, reg]) =>
-    registerOrUpdatePlugin(url, reg.tier, builtInSourcesMap)
+    registerOrUpdatePlugin(url, reg.tier, builtInSourcesMap, { resetLogs: false })
   );
   const results = await Promise.allSettled(tasks);
   persistDynamicPluginsToStorage();
-  return results.map((r) =>
-    r.status === "fulfilled"
+
+  const mapped = results.map((r) =>
+    r.status === "fulfilled" && r.value
       ? r.value
       : { status: "error", message: "更新失败" }
   );
+  aggregateSyncDiagnostics(mapped);
+
+  return mapped;
 }
 
 /**
@@ -2343,6 +3420,7 @@ function getActiveDynamicPlugins(tier = null) {
 module.exports = {
   dynamicRegistry,
   registerOrUpdatePlugin,
+  registerPluginBatch,
   syncCustomPlugins,
   updateAllRegisteredPlugins,
   getActiveDynamicPlugins,
@@ -2367,6 +3445,8 @@ module.exports = {
  * 2. 单向向下平滑梯队：只有在当前请求的音质无法获取时，才在用户允许降级的前提下逐级向下试探，保底出声；
  * 3. 强容错：捕获插件抛出的任何异常，避免因单源不支持特定音质而导致整体假死或误报“没有”。
  */
+
+const { isTlsOrConnectionError } = require("../utils/http");
 
 function isInvalid404Url(url) {
   if (!url || typeof url !== "string") return true;
@@ -2417,19 +3497,77 @@ function getQualityFallbackLadder(requestedQuality = "standard", allowDowngrade 
   }
 }
 
+function getMediaSourceWithTimeout(source, item, quality, timeoutMs = 2800) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        const err = new Error("GET_MEDIA_TIMEOUT");
+        err._timedOut = true;
+        reject(err);
+      }
+    }, timeoutMs);
+
+    try {
+      Promise.resolve(source.getMediaSource(item, quality)).then(
+        (res) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(res);
+          }
+        },
+        (err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+          }
+        }
+      );
+    } catch (syncErr) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(syncErr);
+      }
+    }
+  });
+}
+
+function isFatalNetworkError(err) {
+  if (!err) return false;
+  if (err._timedOut || isTlsOrConnectionError(err)) return true;
+  if (err.response) return false;
+  const code = String(err.code || "").toUpperCase();
+  const msg = String(err.message || "").toLowerCase();
+  return (
+    code === "ENOTFOUND" ||
+    code === "EAI_AGAIN" ||
+    code === "ERR_NETWORK" ||
+    msg.includes("timeout") ||
+    msg.includes("无法连接") ||
+    msg.includes("network error")
+  );
+}
+
 /**
- * 对指定音源安全拉取音频直链（含平滑降级处理）
+ * 对指定音源安全拉取音频直链（含平滑降级、超时熔断与死链快速中止）
  * @param {object} source - 音源实例
  * @param {object} item - 歌曲条目
  * @param {string} requestedQuality - 客户端请求的音质
  * @param {boolean} allowDowngrade - 是否允许降级
+ * @param {number} perCallTimeoutMs - 单次音质请求最大等待时间
  * @returns {Promise<{ mediaRes: object, qualityUsed: string } | null>}
  */
 async function safeGetMediaSourceWithFallback(
   source,
   item,
   requestedQuality = "standard",
-  allowDowngrade = true
+  allowDowngrade = true,
+  perCallTimeoutMs = 2800,
+  options = {}
 ) {
   if (!source || typeof source.getMediaSource !== "function") {
     return null;
@@ -2439,7 +3577,7 @@ async function safeGetMediaSourceWithFallback(
 
   for (const q of ladder) {
     try {
-      const res = await source.getMediaSource(item, q);
+      const res = await getMediaSourceWithTimeout(source, item, q, perCallTimeoutMs);
       if (
         res &&
         res.url &&
@@ -2453,7 +3591,13 @@ async function safeGetMediaSourceWithFallback(
         };
       }
     } catch (err) {
-      // 捕获第三方插件因不支持高音质直接抛出的异常，继续尝试下一梯队
+      // 若宿主域名本身 TLS 断连、超时或不可达，没必要再连续失败重试 remaining quality tiers
+      if (isFatalNetworkError(err)) {
+        if (options && typeof options.onFatalError === "function") {
+          options.onFatalError(err);
+        }
+        return null;
+      }
     }
   }
 
@@ -2463,6 +3607,8 @@ async function safeGetMediaSourceWithFallback(
 module.exports = {
   isInvalid404Url,
   getQualityFallbackLadder,
+  getMediaSourceWithTimeout,
+  isFatalNetworkError,
   safeGetMediaSourceWithFallback,
 };
 
@@ -2471,6 +3617,7 @@ module.exports = {
 "use strict";
 
 const axios = require("axios");
+const { httpGet } = require("../utils/http");
 
 /**
  * 判断是否为插件代码或合集配置的安装链接
@@ -2556,7 +3703,7 @@ async function resolveMusicSheet(
   if (neteaseMatch && neteaseMatch[1]) {
     const sheetId = neteaseMatch[1];
     try {
-      const res = await axios.get(
+      const res = await httpGet(
         `https://music.163.com/api/v6/playlist/detail?id=${sheetId}`,
         {
           headers: {
@@ -2593,7 +3740,7 @@ async function resolveMusicSheet(
   if (qqMatch && qqMatch[1]) {
     const disstid = qqMatch[1];
     try {
-      const res = await axios.get(
+      const res = await httpGet(
         `https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?type=1&json=1&utf8=1&onlysong=0&disstid=${disstid}&format=json`,
         {
           headers: {
@@ -2629,8 +3776,8 @@ async function resolveMusicSheet(
   if (kuwoMatch && kuwoMatch[1]) {
     const pid = kuwoMatch[1];
     try {
-      const res = await axios.get(
-        `http://m.kuwo.cn/newh5/singles/songlistinfo?pid=${pid}`,
+      const res = await httpGet(
+        `https://m.kuwo.cn/newh5/singles/songlistinfo?pid=${pid}`,
         {
           headers: {
             "User-Agent":
@@ -2663,8 +3810,8 @@ async function resolveMusicSheet(
   if (kugouMatch && kugouMatch[1]) {
     const specialid = kugouMatch[1];
     try {
-      const res = await axios.get(
-        `http://mobilecdn.kugou.com/api/v3/special/song?specialid=${specialid}&format=json`,
+      const res = await httpGet(
+        `https://mobilecdn.kugou.com/api/v3/special/song?specialid=${specialid}&format=json`,
         {
           headers: {
             "User-Agent":
@@ -2766,7 +3913,7 @@ module.exports = {
   "./core/comment-resolver": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
-const axios = require("axios");
+const { httpGet, parseBooleanFlag } = require("../utils/http");
 const { cleanTitle, cleanArtist } = require("./matcher");
 
 // LRU 缓存：记录歌曲到第三方平台歌曲ID的映射，加速后续分页请求 (容量 500)
@@ -2811,7 +3958,7 @@ async function getNeteaseComments(musicItem, page = 1) {
     if (!q) return { isEnd: true, data: [] };
 
     try {
-      const searchRes = await axios.get("https://music.163.com/api/cloudsearch/pc", {
+      const searchRes = await httpGet("https://music.163.com/api/cloudsearch/pc", {
         params: { s: q, type: 1, limit: 3, offset: 0 },
         headers: {
           "User-Agent":
@@ -2839,7 +3986,7 @@ async function getNeteaseComments(musicItem, page = 1) {
   const offset = (Math.max(1, page) - 1) * pageSize;
 
   try {
-    const res = await axios.get(
+    const res = await httpGet(
       `https://music.163.com/api/v1/resource/comments/R_SO_4_${songId}`,
       {
         params: { limit: pageSize, offset },
@@ -2943,7 +4090,7 @@ async function getQQComments(musicItem, page = 1) {
     if (!q) return { isEnd: true, data: [] };
 
     try {
-      const searchRes = await axios.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
+      const searchRes = await httpGet("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
         params: { p: 1, n: 3, w: q, format: "json" },
         headers: {
           "User-Agent":
@@ -2971,7 +4118,7 @@ async function getQQComments(musicItem, page = 1) {
   const pageNum = Math.max(0, page - 1);
 
   try {
-    const res = await axios.get(
+    const res = await httpGet(
       "https://c.y.qq.com/base/fcgi-bin/fcg_global_comment_h5.fcg",
       {
         params: {
@@ -3070,8 +4217,7 @@ async function resolveMusicCommentsWithFallback(
   if (!musicItem) return { isEnd: true, data: [] };
 
   // 是否开启跨源热评兜底（默认 true，若用户在设置中填 false 则关闭）
-  const allowCrossFallback =
-    env.enableCrossComments !== "false" && env.enableCrossComments !== false;
+  const allowCrossFallback = parseBooleanFlag(env.enableCrossComments, true);
 
   // -------------------------------------------------------------
   // Step 1: 原音源优先策略 (若当前歌曲有明确的 _source 且已加载)
@@ -3154,7 +4300,7 @@ module.exports = {
   "./core/lyric-searcher": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
-const axios = require("axios");
+const { httpGet, httpPost, parseLooseJson } = require("../utils/http");
 
 let config = {};
 try {
@@ -3179,7 +4325,7 @@ const platformName = config?.platform || "智能多源聚合";
  */
 async function searchNetEaseLyrics(query, page = 1, pageSize = 10) {
   try {
-    const res = await axios.get("https://music.163.com/api/search/get/web", {
+    const res = await httpGet("https://music.163.com/api/search/get/web", {
       params: {
         s: query,
         type: 1, // 歌曲搜索能精准定位正版音频及歌词
@@ -3207,6 +4353,7 @@ async function searchNetEaseLyrics(query, page = 1, pageSize = 10) {
         artwork: s.album?.picUrl || defaultArtwork,
         _source: "netease",
         platform: platformName,
+        _isLyricSearchItem: true,
       })),
     };
   } catch (e) {
@@ -3225,7 +4372,7 @@ async function searchQQLyrics(query, page = 1, pageSize = 10) {
   };
 
   try {
-    const res = await axios.post(
+    const res = await httpPost(
       "https://u.y.qq.com/cgi-bin/musicu.fcg",
       {
         comm: { ct: "19", cv: "1873", uin: "0" },
@@ -3261,6 +4408,7 @@ async function searchQQLyrics(query, page = 1, pageSize = 10) {
           : defaultArtwork,
         _source: "qq",
         platform: platformName,
+        _isLyricSearchItem: true,
       })),
     };
   } catch (e) {
@@ -3289,6 +4437,7 @@ async function searchKuwoLyrics(query, page = 1, pageSize = 10, kuwoSource) {
             artwork: s.artwork || defaultArtwork,
             _source: "kuwo",
             platform: platformName,
+            _isLyricSearchItem: true,
           })),
         };
       }
@@ -3297,7 +4446,7 @@ async function searchKuwoLyrics(query, page = 1, pageSize = 10, kuwoSource) {
 
   // 2. 独立轻量 HTTP 备选通道 (纯净版与脱机模式通用)
   try {
-    const res = await axios.get("https://search.kuwo.cn/r.s", {
+    const res = await httpGet("https://search.kuwo.cn/r.s", {
       params: {
         all: query,
         ft: "music",
@@ -3311,9 +4460,10 @@ async function searchKuwoLyrics(query, page = 1, pageSize = 10, kuwoSource) {
       headers: {
         "User-Agent": "okhttp/3.10.0",
       },
+      responseType: "text",
       timeout: 4000,
     });
-    const parsed = Function('"use strict"; return (' + res.data + ');')();
+    const parsed = parseLooseJson(res.data);
     const list = parsed?.abslist || [];
     const total = parseInt(parsed?.TOTAL) || list.length;
     return {
@@ -3331,6 +4481,7 @@ async function searchKuwoLyrics(query, page = 1, pageSize = 10, kuwoSource) {
           artwork: defaultArtwork,
           _source: "kuwo",
           platform: platformName,
+          _isLyricSearchItem: true,
         };
       }),
     };
@@ -3364,7 +4515,9 @@ async function searchDynamicPluginLyrics(plugin, query, page = 1, pageSize = 10)
         album: (item.album ? item.album + " · " : "") + `[${pluginName}]`,
         artwork: item.artwork || item.cover || defaultArtwork,
         _source: plugin.key || pluginName,
+        _sourceUrl: plugin._sourceUrl || "",
         platform: platformName,
+        _isLyricSearchItem: true,
       }));
     }
   } catch (e) {}
@@ -3468,7 +4621,7 @@ async function unifiedSearchLyric(query, page = 1, env = {}, builtInSources = {}
 async function directFetchNetEaseLyric(id) {
   if (!id) return null;
   try {
-    const res = await axios.get("https://music.163.com/api/song/lyric", {
+    const res = await httpGet("https://music.163.com/api/song/lyric", {
       params: { id, lv: 1, kv: 1, tv: -1 },
       headers: {
         Referer: "https://music.163.com",
@@ -3491,7 +4644,7 @@ async function directFetchNetEaseLyric(id) {
 async function directFetchQQLyric(songmid) {
   if (!songmid) return null;
   try {
-    const res = await axios.get("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg", {
+    const res = await httpGet("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg", {
       params: {
         songmid,
         g_tk: 5381,
@@ -3520,7 +4673,7 @@ async function directFetchKuwoLyric(rid) {
   if (!rid) return null;
   const cleanId = String(rid).replace(/^MUSIC_/, "");
   try {
-    const res = await axios.get("http://m.kuwo.cn/newh5/singles/songinfoandlrc", {
+    const res = await httpGet("https://m.kuwo.cn/newh5/singles/songinfoandlrc", {
       params: { musicId: cleanId },
       headers: { "User-Agent": "Mozilla/5.0" },
       timeout: 4000,
@@ -3541,8 +4694,22 @@ async function directFetchKuwoLyric(rid) {
   return null;
 }
 
+function pickUsableLyricResult(res) {
+  if (!res || typeof res !== "object") return null;
+  const hasRaw =
+    typeof res.rawLrc === "string" && res.rawLrc.trim().length > 5;
+  const hasUrl =
+    typeof res.lrc === "string" && /^https?:\/\//i.test(res.lrc.trim());
+  if (!hasRaw && !hasUrl) return null;
+  return {
+    rawLrc: hasRaw ? res.rawLrc : "",
+    lrc: hasUrl ? res.lrc.trim() : "",
+    translation: res.translation || "",
+  };
+}
+
 /**
- * 针对搜索选中的特定歌词项进行精准提取 (0ms 预取命中 + 独立高可用 HTTP 直通)
+ * 针对搜索选中的特定歌词项进行精准提取 (0ms 预取命中 + 独立高可用 HTTP 直通 + 远程 lrc URL 透传)
  */
 async function resolveDirectLyricItem(musicItem, builtInSources = {}, dynamicSources = []) {
   // 1. 如果已预加载有 rawLrc，直接 0ms 返回
@@ -3555,14 +4722,28 @@ async function resolveDirectLyricItem(musicItem, builtInSources = {}, dynamicSou
 
   const idStr = String(musicItem.id || "");
   const rawId = musicItem._rawId || idStr.replace(/^lrc_[a-z0-9]+_/, "");
+  const isSearchTarget = !!musicItem._isLyricSearchItem || idStr.startsWith("lrc_");
+
+  // 若非歌词搜索点击项，直接交给外层 Step 1/Step 1.5 处理，避免与 origSource 重复调用以及 _source 为空时误匹配动态插件
+  if (!isSearchTarget) {
+    return { rawLrc: "", translation: "" };
+  }
+
+  const callGetLyricWithTimeout = (fn, timeoutMs = 2000) =>
+    Promise.race([
+      Promise.resolve().then(fn),
+      new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]).catch(() => null);
 
   // 2. 网易云定向拉取 (优先内置源，备选直连 HTTP)
   if (musicItem._source === "netease" || idStr.startsWith("lrc_netease_")) {
     const neSource = builtInSources.netease;
     if (neSource && typeof neSource.getLyric === "function") {
       try {
-        const res = await neSource.getLyric({ id: rawId });
-        if (res && res.rawLrc && res.rawLrc.trim().length > 10) return res;
+        const picked = pickUsableLyricResult(
+          await callGetLyricWithTimeout(() => neSource.getLyric({ id: rawId }))
+        );
+        if (picked) return picked;
       } catch (e) {}
     }
     const directRes = await directFetchNetEaseLyric(rawId);
@@ -3574,8 +4755,12 @@ async function resolveDirectLyricItem(musicItem, builtInSources = {}, dynamicSou
     const qqSource = builtInSources.qq;
     if (qqSource && typeof qqSource.getLyric === "function") {
       try {
-        const res = await qqSource.getLyric({ songmid: musicItem.songmid || rawId });
-        if (res && res.rawLrc && res.rawLrc.trim().length > 10) return res;
+        const picked = pickUsableLyricResult(
+          await callGetLyricWithTimeout(() =>
+            qqSource.getLyric({ songmid: musicItem.songmid || rawId })
+          )
+        );
+        if (picked) return picked;
       } catch (e) {}
     }
     const directRes = await directFetchQQLyric(musicItem.songmid || rawId);
@@ -3587,23 +4772,58 @@ async function resolveDirectLyricItem(musicItem, builtInSources = {}, dynamicSou
     const kwSource = builtInSources.kuwo;
     if (kwSource && typeof kwSource.getLyric === "function") {
       try {
-        const res = await kwSource.getLyric({ id: rawId });
-        if (res && res.rawLrc && res.rawLrc.trim().length > 10) return res;
+        const picked = pickUsableLyricResult(
+          await callGetLyricWithTimeout(() => kwSource.getLyric({ id: rawId }))
+        );
+        if (picked) return picked;
       } catch (e) {}
     }
     const directRes = await directFetchKuwoLyric(rawId);
     if (directRes) return directRes;
   }
-  // 5. 动态插件定向拉取
 
-  const matchedDynamic = (dynamicSources || []).find(
-    (ds) => ds && (ds.key === musicItem._source || ds.name === musicItem._source)
-  );
-  if (matchedDynamic && typeof matchedDynamic.getLyric === "function") {
+  // 5. 动态插件定向拉取（严格校验非空 _sourceUrl / _source，彻底杜绝 undefined === undefined 误中全量插件）
+  const targetSourceUrl = String(musicItem._sourceUrl || "").trim();
+  const targetSourceKey = String(musicItem._source || "").trim().toLowerCase();
+  const matchedDynamics =
+    targetSourceUrl || targetSourceKey
+      ? (dynamicSources || []).filter(
+          (ds) =>
+            ds &&
+            typeof ds.getLyric === "function" &&
+            ((targetSourceUrl && ds._sourceUrl === targetSourceUrl) ||
+              (targetSourceKey &&
+                ((ds.key && String(ds.key).toLowerCase() === targetSourceKey) ||
+                  (ds.platform && String(ds.platform).toLowerCase() === targetSourceKey) ||
+                  (ds.name && String(ds.name).toLowerCase() === targetSourceKey))))
+        )
+      : [];
+  if (targetSourceUrl && matchedDynamics.length > 1) {
+    matchedDynamics.sort((a, b) => {
+      const aExact = a._sourceUrl === targetSourceUrl ? 0 : 1;
+      const bExact = b._sourceUrl === targetSourceUrl ? 0 : 1;
+      return aExact - bExact;
+    });
+  }
+  for (const matchedDynamic of matchedDynamics) {
     try {
-      const res = await matchedDynamic.getLyric({ ...musicItem, id: rawId });
-      if (res && res.rawLrc && res.rawLrc.trim().length > 10) return res;
+      const picked = pickUsableLyricResult(
+        await callGetLyricWithTimeout(
+          () => matchedDynamic.getLyric({ ...musicItem, id: rawId }),
+          2000
+        )
+      );
+      if (picked) return picked;
     } catch (e) {}
+  }
+
+  // 6. 若歌词搜索条目本身携带了 .lrc URL，则直接透传给上层 fetchRemoteLrcIfNeeded 拉取
+  if (typeof musicItem.lrc === "string" && /^https?:\/\//i.test(musicItem.lrc.trim())) {
+    return {
+      rawLrc: "",
+      lrc: musicItem.lrc.trim(),
+      translation: musicItem.translation || "",
+    };
   }
 
   return { rawLrc: "", translation: "" };
@@ -3621,10 +4841,1206 @@ module.exports = {
 };
 
   },
+  "./core/fallback-helpers": function(module, exports, require, env, getUserVariables, __musicfree_require) {
+"use strict";
+
+const { httpGet, parseBooleanFlag, isTlsOrConnectionError } = require("../utils/http");
+const {
+  getMediaSourceWithTimeout,
+  isFatalNetworkError,
+  getQualityFallbackLadder,
+} = require("./quality-fallback");
+
+const AUDIO_EXTS = new Set([
+  "mp3", "flac", "m4a", "m4s", "aac", "ogg", "wav", "ape", "wma", "opus", "webm",
+]);
+const SCRIPT_EXTS = new Set([
+  "php", "jsp", "asp", "aspx", "do", "action", "cgi",
+]);
+
+const AUDIOBOOK_OR_STORAGE_RE =
+  /喜马拉雅|ximalaya|猫耳|荔枝|lizhi|番茄|fanqie|cctv|听音|webdav|navidrome|emby|jellyfin|alist|udio|audiomack/i;
+const DJ_SOURCE_RE =
+  /(?:^|[^a-z])dj|mix|舞曲|电音阁|串烧|先上|皮狗|清风|宝贝|魅力|小熊电音/i;
+
+/**
+ * 运行期音源健康状态追踪（基于延迟与连续失败做会话级降权熔断，5 分钟自动衰减恢复）
+ */
+const HEALTH_DECAY_MS = 5 * 60 * 1000;
+const sourceHealthMap = new Map();
+
+const SOFT_FAIL_SINK_THRESHOLD = 3;
+
+function getSourceHealthId(source) {
+  if (!source) return "";
+  return String(source._sourceUrl || source.key || source.platform || source.name || "").trim();
+}
+
+function getSourceHealthState(source) {
+  const id = getSourceHealthId(source);
+  if (!id) return null;
+  const st = sourceHealthMap.get(id);
+  if (!st) return null;
+  if (st.lastFailAt && Date.now() - st.lastFailAt > HEALTH_DECAY_MS) {
+    sourceHealthMap.delete(id);
+    return null;
+  }
+  return st;
+}
+
+function recordSearchLatency(source, elapsedMs = 0) {
+  const id = getSourceHealthId(source);
+  if (!id) return;
+  const prev = getSourceHealthState(source) || {
+    fatalFailStreak: 0,
+    softFailStreak: 0,
+    failStreak: 0,
+    lastFailAt: 0,
+    avgMs: 0,
+  };
+  const avgMs = prev.avgMs ? Math.round(prev.avgMs * 0.6 + elapsedMs * 0.4) : elapsedMs;
+  sourceHealthMap.set(id, { ...prev, avgMs });
+}
+
+function recordSourceSuccess(source, elapsedMs = 0) {
+  const id = getSourceHealthId(source);
+  if (!id) return;
+  const prev = sourceHealthMap.get(id) || {};
+  const avgMs = prev.avgMs ? Math.round(prev.avgMs * 0.6 + elapsedMs * 0.4) : elapsedMs;
+  sourceHealthMap.set(id, {
+    fatalFailStreak: 0,
+    softFailStreak: 0,
+    failStreak: 0,
+    lastFailAt: 0,
+    avgMs,
+  });
+}
+
+function recordSourceSoftFailure(source) {
+  const id = getSourceHealthId(source);
+  if (!id) return;
+  const prev = getSourceHealthState(source) || {
+    fatalFailStreak: 0,
+    softFailStreak: 0,
+    failStreak: 0,
+    avgMs: 0,
+  };
+  const softFailStreak = (prev.softFailStreak || 0) + 1;
+  sourceHealthMap.set(id, {
+    fatalFailStreak: prev.fatalFailStreak || 0,
+    softFailStreak,
+    failStreak: (prev.fatalFailStreak || 0) + (softFailStreak >= SOFT_FAIL_SINK_THRESHOLD ? softFailStreak : 0),
+    lastFailAt: Date.now(),
+    avgMs: prev.avgMs || 0,
+  });
+}
+
+function recordSourceFailure(source, isFatal = false) {
+  if (isFatal === "soft") {
+    recordSourceSoftFailure(source);
+    return;
+  }
+  const id = getSourceHealthId(source);
+  if (!id) return;
+  const prev = getSourceHealthState(source) || {
+    fatalFailStreak: 0,
+    softFailStreak: 0,
+    failStreak: 0,
+    avgMs: 0,
+  };
+  const delta = isFatal ? 2 : 1;
+  const fatalFailStreak = (prev.fatalFailStreak || 0) + delta;
+  sourceHealthMap.set(id, {
+    fatalFailStreak,
+    softFailStreak: prev.softFailStreak || 0,
+    failStreak: fatalFailStreak + (prev.softFailStreak || 0),
+    lastFailAt: Date.now(),
+    avgMs: prev.avgMs || 0,
+  });
+}
+
+/**
+ * 通用 Promise 超时包装（避免同步异常或永不返回的第三方插件挂死链路）
+ */
+function withTimeout(taskOrPromise, timeoutMs, fallbackValue = null) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve(fallbackValue);
+      }
+    }, timeoutMs);
+
+    try {
+      const p =
+        typeof taskOrPromise === "function"
+          ? Promise.resolve().then(taskOrPromise)
+          : Promise.resolve(taskOrPromise);
+      p.then(
+        (res) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(res);
+          }
+        },
+        () => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(fallbackValue);
+          }
+        }
+      );
+    } catch (e) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve(fallbackValue);
+      }
+    }
+  });
+}
+
+/**
+ * 带超时与状态标记的搜索（区分“正常无结果”与“超时/网络错误”，避免对死源二次重搜浪费时间）
+ */
+function searchWithStatusTimeout(source, query, page = 1, type = "music", timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve({ isEnd: true, data: [], _timedOut: true, _error: false });
+      }
+    }, timeoutMs);
+
+    try {
+      Promise.resolve(source.search(query, page, type)).then(
+        (res) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(res || { isEnd: true, data: [] });
+          }
+        },
+        () => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve({ isEnd: true, data: [], _timedOut: false, _error: true });
+          }
+        }
+      );
+    } catch (e) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({ isEnd: true, data: [], _timedOut: false, _error: true });
+      }
+    }
+  });
+}
+
+/**
+ * 过滤并按能力与健康度排布音源顺序（确保 Chunk 0 由健康主流音乐源主导，过滤歌词/纯专辑等不可播源）
+ */
+function orderSourcesForPlayback(orderedSources = [], target = {}) {
+  const hint = `${target.title || ""} ${target.artist || ""}`.toLowerCase();
+  const wantsDj = /dj|remix|电音|串烧|慢摇|舞曲/.test(hint);
+  const wantsAudio = /有声|相声|评书|广播|播客|小说|故事/.test(hint);
+
+  const candidates = [];
+  for (let i = 0; i < orderedSources.length; i++) {
+    const s = orderedSources[i];
+    if (!s || typeof s.search !== "function" || typeof s.getMediaSource !== "function") {
+      continue;
+    }
+    if (Array.isArray(s.supportedSearchType) && !s.supportedSearchType.includes("music")) {
+      continue;
+    }
+
+    const label = `${s.name || ""} ${s.platform || ""} ${s.key || ""}`;
+    const health = getSourceHealthState(s);
+    const fatalStreak = health ? health.fatalFailStreak || 0 : 0;
+    const softStreak = health ? health.softFailStreak || 0 : 0;
+
+    let bucket = 0;
+    if (fatalStreak >= 1 || softStreak >= SOFT_FAIL_SINK_THRESHOLD) {
+      bucket += 20 + Math.min(fatalStreak + softStreak, 12);
+    } else if (AUDIOBOOK_OR_STORAGE_RE.test(label) && !wantsAudio) {
+      bucket += 10;
+    } else if (DJ_SOURCE_RE.test(label) && !wantsDj) {
+      bucket += 8;
+    } else if (s._tier === "tier3" || s.key === "fivesing" || s.key === "ximalaya") {
+      bucket += 4;
+    }
+
+    candidates.push({ source: s, bucket, index: i });
+  }
+
+  candidates.sort((a, b) => a.bucket - b.bucket || a.index - b.index);
+  return candidates.map((c) => c.source);
+}
+
+/**
+ * 分批竞速搜索：只要有高置信度匹配（>=88分）或任意命中过短暂宽限即立刻出链，不被同批死源超时拖垮
+ */
+function raceSearchChunk({
+  chunkSources,
+  queryStr,
+  titleClean,
+  artistClean,
+  target,
+  findBestMatch,
+  primaryTimeoutMs = 1500,
+  retryTimeoutMs = 1000,
+}) {
+  return new Promise((resolve) => {
+    const matches = [];
+    let resolvedEarly = false;
+    let graceTimer = null;
+
+    const finishEarly = () => {
+      if (resolvedEarly) return;
+      resolvedEarly = true;
+      if (graceTimer) clearTimeout(graceTimer);
+      resolve({
+        matches: matches.slice(),
+        settledAll: false,
+        remainingPromise,
+      });
+    };
+
+    const scheduleGrace = (ms) => {
+      if (resolvedEarly) return;
+      if (graceTimer) clearTimeout(graceTimer);
+      graceTimer = setTimeout(finishEarly, ms);
+    };
+
+    let bestScoreSoFar = 0;
+
+    const tasks = chunkSources.map(async (source) => {
+      const startAt = Date.now();
+      try {
+        const res1 = await searchWithStatusTimeout(
+          source,
+          queryStr,
+          1,
+          "music",
+          primaryTimeoutMs
+        );
+        if (res1._timedOut || res1._error) {
+          recordSourceFailure(source, true);
+          return null;
+        }
+
+        let list = Array.isArray(res1.data) ? res1.data : [];
+        if (list.length === 0 && artistClean) {
+          const res2 = await searchWithStatusTimeout(
+            source,
+            titleClean,
+            1,
+            "music",
+            retryTimeoutMs
+          );
+          if (res2._timedOut || res2._error) {
+            recordSourceFailure(source, true);
+            return null;
+          }
+          if (Array.isArray(res2.data)) list = res2.data;
+        }
+
+        recordSearchLatency(source, Date.now() - startAt);
+        if (list.length > 0) {
+          const bestMatch = findBestMatch(target, list, 55);
+          if (bestMatch) {
+            const score = bestMatch._matchScore || 0;
+            const hit = { source, bestMatch, score };
+            matches.push(hit);
+            if (!resolvedEarly) {
+              if (score >= 88 && bestScoreSoFar < 88) {
+                bestScoreSoFar = score;
+                scheduleGrace(180);
+              } else if (matches.length === 1) {
+                bestScoreSoFar = score;
+                scheduleGrace(score >= 88 ? 180 : 420);
+              }
+            }
+            return hit;
+          }
+        }
+      } catch (e) {
+        recordSourceFailure(source, isFatalNetworkError(e));
+      }
+      return null;
+    });
+
+    const remainingPromise = Promise.allSettled(tasks).then(() => matches.slice());
+
+    remainingPromise.then(() => {
+      if (!resolvedEarly) {
+        resolvedEarly = true;
+        if (graceTimer) clearTimeout(graceTimer);
+        resolve({
+          matches: matches.slice(),
+          settledAll: true,
+          remainingPromise,
+        });
+      }
+    });
+  });
+}
+
+/**
+ * 统一规范化音频流（安全识别 .php/无后缀 302 重定向、拦截 HTML 错误页与强制下载附件，1400ms 极限探测）
+ */
+async function normalizeMediaSourceShared(mediaRes, isInvalid404Url) {
+  if (!mediaRes || !mediaRes.url || typeof mediaRes.url !== "string") {
+    return null;
+  }
+
+  try {
+    const rawUrl = mediaRes.url.trim();
+    if (isInvalid404Url(rawUrl)) {
+      return null;
+    }
+
+    const cleanPath = rawUrl.split("?")[0].split("#")[0];
+    const match = cleanPath.match(/\.([a-zA-Z0-9]+)$/);
+    const ext = match ? match[1].toLowerCase() : "";
+
+    // 1. 标准音频后缀直接 0 延迟放行
+    if (AUDIO_EXTS.has(ext)) {
+      return mediaRes;
+    }
+
+    // 2. .php 脚本或无后缀直链，快速追踪跳转并校验证书/响应头
+    if (SCRIPT_EXTS.has(ext) || !ext) {
+      let finalUrl = rawUrl;
+      let contentType = "";
+      let isUnplayableAttachment = false;
+
+      try {
+        const probeRes = await httpGet(rawUrl, {
+          headers: mediaRes.headers || {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          },
+          maxRedirects: 3,
+          timeout: 1100,
+          responseType: "stream",
+        });
+
+        if (probeRes.status === 404 || probeRes.status === 410 || probeRes.status >= 500) {
+          if (probeRes.data && typeof probeRes.data.destroy === "function") {
+            probeRes.data.destroy();
+          }
+          return null;
+        }
+
+        if (
+          probeRes.request &&
+          probeRes.request.res &&
+          probeRes.request.res.responseUrl
+        ) {
+          finalUrl = probeRes.request.res.responseUrl;
+        } else if (probeRes.config && probeRes.config.url) {
+          finalUrl = probeRes.config.url;
+        }
+
+        if (probeRes.headers) {
+          contentType = (probeRes.headers["content-type"] || "").toLowerCase();
+          const disp = (probeRes.headers["content-disposition"] || "").toLowerCase();
+          if (disp.includes("attachment") || contentType.includes("text/html")) {
+            isUnplayableAttachment = true;
+          }
+        }
+
+        if (probeRes.data && typeof probeRes.data.destroy === "function") {
+          probeRes.data.destroy();
+        }
+      } catch (probeErr) {
+        const status = probeErr && probeErr.response ? probeErr.response.status : 0;
+        if (status === 404 || status === 410 || status >= 500) {
+          return null;
+        }
+      }
+
+      if (isUnplayableAttachment) {
+        return null;
+      }
+
+      const finalCleanPath = finalUrl.split("?")[0].split("#")[0];
+      const finalMatch = finalCleanPath.match(/\.([a-zA-Z0-9]+)$/);
+      const finalExt = finalMatch ? finalMatch[1].toLowerCase() : "";
+
+      if (AUDIO_EXTS.has(finalExt)) {
+        return {
+          ...mediaRes,
+          url: finalUrl,
+        };
+      }
+
+      let targetExt = "mp3";
+      if (contentType.includes("flac")) targetExt = "flac";
+      else if (
+        contentType.includes("mp4") ||
+        contentType.includes("m4a") ||
+        contentType.includes("aac")
+      ) {
+        targetExt = "m4a";
+      } else if (contentType.includes("ogg")) targetExt = "ogg";
+      else if (contentType.includes("wav")) targetExt = "wav";
+
+      const fixedUrl = finalUrl.includes("?")
+        ? `${finalUrl}&_ext=.${targetExt}`
+        : `${finalUrl}?_ext=.${targetExt}`;
+
+      return {
+        ...mediaRes,
+        url: fixedUrl,
+        _inferredExt: targetExt,
+      };
+    }
+  } catch (err) {}
+
+  return mediaRes;
+}
+
+/**
+ * 候选源音质两轮竞速出链（先严守目标音质，再收拢慢到源；均不可用后方触发向下兼容降级）
+ */
+async function resolveCandidatesMedia({
+  raceResult,
+  quality,
+  allowDowngrade,
+  normalizeMediaSource,
+  isInvalid404Url,
+  matchCache,
+  playbackSession,
+  target,
+  enableCache,
+  defaultDisplayName,
+  softFailedSourcesSet = null,
+}) {
+  const triedExactQualitySources = new Set();
+  const fatallyFailedSources = new Set();
+  const failedQualitiesBySource = new Map();
+  const attemptedNonFatalSources = new Set();
+  let collected = (raceResult.matches || []).slice();
+
+  const expectedLadder = allowDowngrade
+    ? getQualityFallbackLadder(quality, true)
+    : [quality];
+
+  const recordAttemptFailure = (source, attemptedQuality) => {
+    if (!source || fatallyFailedSources.has(source)) return;
+    attemptedNonFatalSources.add(source);
+    let qSet = failedQualitiesBySource.get(source);
+    if (!qSet) {
+      qSet = new Set();
+      failedQualitiesBySource.set(source, qSet);
+    }
+    qSet.add(attemptedQuality);
+  };
+
+  const applySongSoftFailures = (wonSource = null, exhaustedAllQualities = false) => {
+    const softTargetSet = softFailedSourcesSet || new Set();
+    for (const s of attemptedNonFatalSources) {
+      if (!s || s === wonSource || fatallyFailedSources.has(s) || softTargetSet.has(s)) {
+        continue;
+      }
+      const qSet = failedQualitiesBySource.get(s);
+      const failedWholeLadder =
+        exhaustedAllQualities ||
+        (qSet && expectedLadder.every((q) => qSet.has(q)));
+      if (failedWholeLadder) {
+        softTargetSet.add(s);
+        recordSourceSoftFailure(s);
+      }
+    }
+  };
+
+  const fetchBestCandidateAtQuality = async (list, targetQuality, perCallTimeoutMs) => {
+    if (!list || list.length === 0) return null;
+    const slots = list.map((candidate) => ({
+      settled: false,
+      value: null,
+      score: candidate.score || 0,
+    }));
+    let settledCount = 0;
+
+    return await new Promise((resolve) => {
+      let resolved = false;
+      let graceTimer = null;
+      let graceDeadline = 0;
+
+      const tryResolveBestReady = (forceAnyReady = false) => {
+        if (resolved) return;
+        for (let i = 0; i < slots.length; i++) {
+          if (slots[i].settled) {
+            if (slots[i].value) {
+              resolved = true;
+              if (graceTimer) clearTimeout(graceTimer);
+              resolve(slots[i].value);
+              return;
+            }
+          } else if (!forceAnyReady) {
+            return;
+          }
+        }
+        if (settledCount === slots.length) {
+          resolved = true;
+          if (graceTimer) clearTimeout(graceTimer);
+          resolve(null);
+        }
+      };
+
+      const getDynamicGraceMs = () => {
+        let firstReadyIdx = -1;
+        let bestReadyScore = -1;
+        for (let i = 0; i < slots.length; i++) {
+          if (slots[i].settled && slots[i].value) {
+            if (firstReadyIdx === -1) firstReadyIdx = i;
+            if (slots[i].score > bestReadyScore) bestReadyScore = slots[i].score;
+          }
+        }
+        if (firstReadyIdx <= 0) return 900;
+        let bestPendingScore = 0;
+        for (let i = 0; i < firstReadyIdx; i++) {
+          if (!slots[i].settled && slots[i].score > bestPendingScore) {
+            bestPendingScore = slots[i].score;
+          }
+        }
+        // 只有次高候选自身高分(>=90)且与榜首分差<=5时才缩短至 380ms，否则保留 900ms 保护精准原唱
+        if (bestReadyScore >= 90 && bestPendingScore - bestReadyScore <= 5) {
+          return 380;
+        }
+        return 900;
+      };
+
+      list.forEach(async (candidate, idx) => {
+        try {
+          const mediaRes = await getMediaSourceWithTimeout(
+            candidate.source,
+            candidate.bestMatch,
+            targetQuality,
+            perCallTimeoutMs
+          );
+          if (
+            mediaRes &&
+            mediaRes.url &&
+            typeof mediaRes.url === "string" &&
+            mediaRes.url.startsWith("http") &&
+            !isInvalid404Url(mediaRes.url)
+          ) {
+            const normRes = await normalizeMediaSource(mediaRes);
+            if (normRes && normRes.url && !isInvalid404Url(normRes.url)) {
+              slots[idx].value = { candidate, normRes };
+            }
+          }
+          if (!slots[idx].value) {
+            recordAttemptFailure(candidate.source, targetQuality);
+          }
+        } catch (mediaErr) {
+          if (isFatalNetworkError(mediaErr)) {
+            fatallyFailedSources.add(candidate.source);
+            recordSourceFailure(candidate.source, true);
+          } else {
+            recordAttemptFailure(candidate.source, targetQuality);
+          }
+        } finally {
+          slots[idx].settled = true;
+          settledCount++;
+          if (!resolved) {
+            tryResolveBestReady(false);
+            if (!resolved && slots.some((s) => s.settled && s.value)) {
+              const targetGraceMs = getDynamicGraceMs();
+              const desiredDeadline = Date.now() + targetGraceMs;
+              if (!graceTimer) {
+                graceDeadline = desiredDeadline;
+                graceTimer = setTimeout(() => tryResolveBestReady(true), targetGraceMs);
+              } else if (desiredDeadline < graceDeadline - 50) {
+                clearTimeout(graceTimer);
+                graceDeadline = desiredDeadline;
+                graceTimer = setTimeout(() => tryResolveBestReady(true), targetGraceMs);
+              }
+            }
+          }
+        }
+      });
+    });
+  };
+
+  const commitWinner = (winner, exhaustedAllQualities = false) => {
+    if (!winner) return null;
+    const { candidate, normRes } = winner;
+    applySongSoftFailures(candidate.source, exhaustedAllQualities);
+    const finalized = commitNormalizedMediaResult({
+      normRes,
+      matchCache,
+      playbackSession,
+      target,
+      sourceObj: candidate.source,
+      isFallback: true,
+      matchedItem: candidate.bestMatch,
+      enableCache,
+      defaultDisplayName,
+    });
+    return {
+      ...finalized,
+      _matchedSong: `${candidate.bestMatch.title} - ${candidate.bestMatch.artist}`,
+      _matchScore: candidate.bestMatch._matchScore,
+    };
+  };
+
+  const tryBatchExactQuality = async (list) => {
+    const sorted = list
+      .filter((c) => !triedExactQualitySources.has(c.source) && !fatallyFailedSources.has(c.source))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+
+    sorted.forEach((c) => triedExactQualitySources.add(c.source));
+    return commitWinner(await fetchBestCandidateAtQuality(sorted, quality, 2500));
+  };
+
+  // 第一轮（快速到达批）：Top 3 并发拉链，严格目标音质
+  const fastHit = await tryBatchExactQuality(collected);
+  if (fastHit) return fastHit;
+
+  // 若批内仍有尚未结束的稍慢候选源，收集完后再补试一轮目标音质（防止早产错过高音质原源）
+  if (!raceResult.settledAll && raceResult.remainingPromise) {
+    const fullMatches = await withTimeout(raceResult.remainingPromise, 950, null);
+    if (Array.isArray(fullMatches) && fullMatches.length > collected.length) {
+      collected = fullMatches;
+      const lateHit = await tryBatchExactQuality(collected);
+      if (lateHit) return lateHit;
+    }
+  }
+
+  // 第二轮：次级音质阶梯向下兼容（同阶梯 Top 3 并发取链）
+  if (allowDowngrade && collected.length > 0) {
+    const ladder = expectedLadder.slice(1);
+    const topCandidates = collected
+      .slice()
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+
+    for (const fallbackQuality of ladder) {
+      const alive = topCandidates.filter((c) => !fatallyFailedSources.has(c.source));
+      if (alive.length === 0) break;
+      const hit = commitWinner(
+        await fetchBestCandidateAtQuality(alive, fallbackQuality, 2200)
+      );
+      if (hit) return hit;
+    }
+  }
+
+  // 全部尝试音质均无可用播放链时，每首歌对失败候选仅记 1 次软失败（绝不在降级循环中重复累加）
+  applySongSoftFailures(null, true);
+  return null;
+}
+
+const LRC_TS_ANY_RE = /\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/;
+const PLACEHOLDER_ONLY_LYRIC_RE =
+  /^(?:暂无歌词|纯音乐(?:[，,。\s]*请(?:您)?欣赏)?|此歌曲为没有填词的纯音乐(?:[，,。\s]*请(?:您)?欣赏)?|没有找到歌词|无歌词|instrumental|no\s*lyrics?)$/i;
+
+function isUsableLyricText(rawLrc) {
+  if (!rawLrc || typeof rawLrc !== "string") return false;
+  const trimmed = rawLrc.trim();
+  if (trimmed.length <= 5) return false;
+  const hasTimestamp = LRC_TS_ANY_RE.test(trimmed);
+  const stripped = trimmed
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!stripped || PLACEHOLDER_ONLY_LYRIC_RE.test(stripped)) {
+    return false;
+  }
+  if (hasTimestamp) {
+    return stripped.length >= 4;
+  }
+  return stripped.length >= 25;
+}
+
+/**
+ * 若歌词结果仅返回了远程 .lrc 链接而缺少 rawLrc 文本，预先下载原文以便统一注入音源标签
+ */
+async function fetchRemoteLrcIfNeeded(lrcRes, timeoutMs = 1800) {
+  if (!lrcRes || typeof lrcRes !== "object") return null;
+  if (isUsableLyricText(lrcRes.rawLrc)) {
+    return lrcRes;
+  }
+  const lrcUrl = typeof lrcRes.lrc === "string" ? lrcRes.lrc.trim() : "";
+  if (lrcUrl && /^https?:\/\//i.test(lrcUrl)) {
+    try {
+      const res = await httpGet(lrcUrl, {
+        timeout: timeoutMs,
+        responseType: "text",
+      });
+      if (res && isUsableLyricText(res.data)) {
+        return {
+          ...lrcRes,
+          rawLrc: res.data,
+        };
+      }
+    } catch (e) {}
+  }
+  return null;
+}
+
+function commitNormalizedMediaResult({
+  normRes,
+  matchCache,
+  playbackSession,
+  target,
+  sourceObj,
+  origSourceKey = "",
+  isFallback = false,
+  matchedItem = null,
+  enableCache = true,
+  defaultDisplayName = "",
+  sourceNameOverride = "",
+}) {
+  const rawLabel =
+    sourceNameOverride ||
+    (sourceObj && (sourceObj.name || sourceObj.platform || sourceObj.key)) ||
+    origSourceKey ||
+    defaultDisplayName;
+  const usedSource =
+    playbackSession.formatSourceName(rawLabel) ||
+    defaultDisplayName ||
+    "备选源";
+
+  if (enableCache && isFallback && matchedItem && sourceObj) {
+    const sKey =
+      sourceObj.key || sourceObj.platform || sourceObj.name || "unknown";
+    matchCache.set(
+      target.title,
+      target.artist,
+      sKey,
+      matchedItem,
+      usedSource,
+      true
+    );
+  }
+
+  if (sourceObj) {
+    recordSourceSuccess(sourceObj);
+  }
+
+  playbackSession.recordActiveSession(
+    target.title,
+    target.artist,
+    usedSource,
+    isFallback
+  );
+
+  return {
+    ...normRes,
+    platform: "智能多源聚合",
+    _sourceUsed: usedSource,
+  };
+}
+
+/**
+ * 统一校验音视频流、清洗重定向与 Content-Type，并在确认可播后再写入记忆与激活会话
+ */
+async function tryFinalizeMediaResult({
+  rawMediaRes,
+  normalizeMediaSource,
+  isInvalid404Url,
+  matchCache,
+  playbackSession,
+  target,
+  sourceObj,
+  origSourceKey = "",
+  isFallback = false,
+  matchedItem = null,
+  enableCache = true,
+  defaultDisplayName = "",
+  sourceNameOverride = "",
+}) {
+  if (
+    !rawMediaRes ||
+    !rawMediaRes.url ||
+    typeof rawMediaRes.url !== "string" ||
+    !rawMediaRes.url.startsWith("http") ||
+    isInvalid404Url(rawMediaRes.url)
+  ) {
+    return null;
+  }
+
+  const normRes = await normalizeMediaSource(rawMediaRes);
+  if (
+    !normRes ||
+    !normRes.url ||
+    typeof normRes.url !== "string" ||
+    isInvalid404Url(normRes.url)
+  ) {
+    return null;
+  }
+
+  return commitNormalizedMediaResult({
+    normRes,
+    matchCache,
+    playbackSession,
+    target,
+    sourceObj,
+    origSourceKey,
+    isFallback,
+    matchedItem,
+    enableCache,
+    defaultDisplayName,
+    sourceNameOverride,
+  });
+}
+
+/**
+ * 多个异步取词通道抢占优先返回第一个非空有效结果（任意一条通道先拿到歌词立即返回，不等待慢通道）
+ */
+function firstValidResult(promises = []) {
+  const validPromises = promises.filter(Boolean);
+  if (validPromises.length === 0) return Promise.resolve(null);
+
+  return new Promise((resolve) => {
+    let remaining = validPromises.length;
+    let done = false;
+
+    for (const p of validPromises) {
+      Promise.resolve(p)
+        .then((val) => {
+          if (!done && val && isUsableLyricText(val.rawLrc)) {
+            done = true;
+            resolve(val);
+            return;
+          }
+          remaining -= 1;
+          if (!done && remaining === 0) resolve(null);
+        })
+        .catch(() => {
+          remaining -= 1;
+          if (!done && remaining === 0) resolve(null);
+        });
+    }
+  });
+}
+
+function findSourceByMeta(sources = [], builtInSources = {}, sourceKey = "", sourceUrl = "") {
+  const keyLower = String(sourceKey || "").trim().toLowerCase();
+  const url = String(sourceUrl || "").trim();
+
+  if (url) {
+    const byUrl = sources.find((s) => s && s._sourceUrl === url);
+    if (byUrl) return byUrl;
+  }
+  if (!keyLower) return null;
+
+  return (
+    builtInSources[keyLower] ||
+    sources.find(
+      (s) =>
+        s &&
+        ((s.key && String(s.key).toLowerCase() === keyLower) ||
+          (s.platform && String(s.platform).toLowerCase() === keyLower) ||
+          (s.name && String(s.name).toLowerCase() === keyLower))
+    ) ||
+    null
+  );
+}
+
+/**
+ * 统一歌词多源极速调度核心：
+ * - Step 0: 预加载或搜索歌词精准点击项
+ * - Step 1/1.5/1.8: 原源 getLyric -> 曲目自带远程 .lrc (含咪咕 HTTP 20ms 回退) -> 已命中秒开记忆源直取 (0 搜索)
+ * - Step 2: 并发公共高质量歌词三通道 (网易云+QQ+酷我) + Top 3 健康动态源并行竞速，彻底消除 50+ 源串行阻塞！
+ */
+async function resolveLyricCore({
+  musicItem,
+  env = {},
+  builtInSources = {},
+  dynamicSources = [],
+  orderedSources = [],
+  findBestMatch,
+  cleanTitle,
+  cleanArtist,
+  searchWithTimeout,
+  playbackSession,
+  matchCache = null,
+}) {
+  const isNoticeEnabled = parseBooleanFlag(env.showSourceInLyric, true);
+  const target = {
+    title: musicItem.title || "",
+    artist: musicItem.artist || "",
+    duration: musicItem.duration || 0,
+  };
+
+  const idStr = String(musicItem.id || "");
+  const isLyricSearch =
+    !!musicItem._isLyricSearchItem || idStr.startsWith("lrc_");
+
+  // 用户在弹窗主动检索/切换歌词时，严禁将歌词提供源（如 netease/qq）误当作播放音源
+  const defaultSourceName = isLyricSearch
+    ? ""
+    : playbackSession.formatSourceName(
+        musicItem._sourceName || musicItem._source || ""
+      );
+
+  const fetchRawLyric = async () => {
+    const {
+      resolveDirectLyricItem,
+      searchNetEaseLyrics,
+      directFetchNetEaseLyric,
+      searchQQLyrics,
+      directFetchQQLyric,
+      searchKuwoLyrics,
+      directFetchKuwoLyric,
+    } = require("./lyric-searcher");
+
+    // 0. 优先处理歌词搜索点击项或自带歌词文本
+    const directLrc = await resolveDirectLyricItem(
+      musicItem,
+      builtInSources,
+      dynamicSources
+    );
+    const readyDirect = await fetchRemoteLrcIfNeeded(directLrc, 1800);
+    if (readyDirect) return readyDirect;
+
+    // 1. 若有明确的原始音源（且非歌词搜索项），先尝试原源直取（单次 1800ms 超时熔断，绝不重复调）
+    const origSourceKey = (musicItem._source || "").trim().toLowerCase();
+    let triedOrigSource = null;
+    if (!isLyricSearch && (origSourceKey || musicItem._sourceUrl)) {
+      triedOrigSource = findSourceByMeta(
+        orderedSources.length > 0 ? orderedSources : dynamicSources,
+        builtInSources,
+        origSourceKey,
+        musicItem._sourceUrl
+      );
+      if (triedOrigSource && typeof triedOrigSource.getLyric === "function") {
+        const origRes = await withTimeout(
+          () => triedOrigSource.getLyric(musicItem),
+          1800,
+          null
+        );
+        const readyOrig = await fetchRemoteLrcIfNeeded(origRes, 1600);
+        if (readyOrig) return readyOrig;
+      }
+    }
+
+    // 1.5 若曲目自身已经携带准确的远程 .lrc 链接（如咪咕搜索条目），直接拉取原词
+    if (!isLyricSearch && musicItem.lrc && typeof musicItem.lrc === "string") {
+      const directItemRemote = await fetchRemoteLrcIfNeeded(
+        {
+          lrc: musicItem.lrc,
+          translation: musicItem.translation || "",
+        },
+        1800
+      );
+      if (directItemRemote) return directItemRemote;
+    }
+
+    // 1.8 若本曲目已在秒开记忆表中绑定过真实可播源（如容灾换源到酷我/QQ），直接向该已匹配条目取词，免搜索 100ms 出词
+    if (!isLyricSearch && matchCache) {
+      await matchCache.ensureReady(30);
+      const cachedMatch = matchCache.get(target.title, target.artist);
+      if (cachedMatch && cachedMatch.sourceKey && cachedMatch.item) {
+        const allPool = orderedSources.length > 0 ? orderedSources : dynamicSources;
+        const cachedSource = findSourceByMeta(
+          allPool,
+          builtInSources,
+          cachedMatch.sourceKey,
+          cachedMatch.item._sourceUrl
+        );
+        if (
+          cachedSource &&
+          cachedSource !== triedOrigSource &&
+          typeof cachedSource.getLyric === "function"
+        ) {
+          const cachedLrc = await withTimeout(
+            () => cachedSource.getLyric(cachedMatch.item),
+            1600,
+            null
+          );
+          const readyCached = await fetchRemoteLrcIfNeeded(cachedLrc, 1400);
+          if (readyCached) return readyCached;
+        }
+      }
+    }
+
+    // 2. 全网高速并发竞速取词：公共高质量三通道（网易/QQ/酷我）与 Top 3 健康动态源并行竞速，谁先成功用谁！
+    const titleClean = cleanTitle(target.title);
+    const artistClean = cleanArtist(target.artist);
+
+    if (titleClean) {
+      const q = artistClean ? `${titleClean} ${artistClean}` : titleClean;
+
+      const neLane = async () => {
+        try {
+          const neSearch = await searchNetEaseLyrics(q, 1, 3);
+          const first = neSearch?.data?.[0];
+          if (!first?._rawId) return null;
+          return await fetchRemoteLrcIfNeeded(
+            await directFetchNetEaseLyric(first._rawId),
+            1500
+          );
+        } catch (e) {
+          return null;
+        }
+      };
+
+      const qqLane = async () => {
+        try {
+          const qqSearch = await searchQQLyrics(q, 1, 3);
+          const first = qqSearch?.data?.[0];
+          const mid = first?.songmid || first?._rawId;
+          if (!mid) return null;
+          return await fetchRemoteLrcIfNeeded(
+            await directFetchQQLyric(mid),
+            1500
+          );
+        } catch (e) {
+          return null;
+        }
+      };
+
+      const kwLane = async () => {
+        try {
+          const kwSearch = await searchKuwoLyrics(q, 1, 3, builtInSources.kuwo);
+          const first = kwSearch?.data?.[0];
+          if (!first?._rawId) return null;
+          return await fetchRemoteLrcIfNeeded(
+            await directFetchKuwoLyric(first._rawId),
+            1500
+          );
+        } catch (e) {
+          return null;
+        }
+      };
+
+      const healthyDynamicPool = orderSourcesForPlayback(
+        orderedSources,
+        target
+      )
+        .filter((s) => s !== triedOrigSource && typeof s.getLyric === "function")
+        .slice(0, 3);
+
+      const dynamicTasks = healthyDynamicPool.map(async (source) => {
+        try {
+          const r = await searchWithTimeout(source, q, 1, "music", 1000);
+          const list = r && Array.isArray(r.data) ? r.data : [];
+          if (list.length === 0) return null;
+          const bestMatch = findBestMatch(target, list, 55);
+          if (!bestMatch) return null;
+          const lrcRes = await withTimeout(() => source.getLyric(bestMatch), 1200, null);
+          return await fetchRemoteLrcIfNeeded(lrcRes, 1200);
+        } catch (e) {
+          return null;
+        }
+      });
+
+      const winner = await firstValidResult([neLane(), qqLane(), kwLane(), ...dynamicTasks]);
+      if (winner) return winner;
+    }
+
+    return { rawLrc: "" };
+  };
+
+  const [lrcRes, sourceInfo] = await Promise.all([
+    fetchRawLyric(),
+    isNoticeEnabled
+      ? playbackSession.getOrWaitSource(
+          target.title,
+          target.artist,
+          defaultSourceName,
+          800,
+          isLyricSearch,
+          { waitOnlyIfResolving: !isLyricSearch }
+        )
+      : Promise.resolve(null),
+  ]);
+
+  return playbackSession.injectSourceTagToLrc(
+    lrcRes,
+    sourceInfo,
+    isNoticeEnabled,
+    target.title
+  );
+}
+
+/**
+ * 统一将网易云榜单列表归类为「网易云音乐官方榜单」与「网易云特色/全球榜」
+ */
+function groupNeteaseTopLists(rawList = [], idPrefix = "") {
+  const official = [];
+  const special = [];
+  const officialNames = [
+    "云音乐飙升榜",
+    "云音乐新歌榜",
+    "网易原创歌曲榜",
+    "云音乐热歌榜",
+  ];
+
+  for (const item of rawList) {
+    if (!item || !item.id) continue;
+    const entry = {
+      id: `${idPrefix}${item.id}`,
+      sheetId: item.id,
+      title: item.name,
+      artwork: item.coverImgUrl,
+      description: item.description || "",
+      playCount: item.playCount,
+      updateFrequency: item.updateFrequency,
+      platform: "智能多源聚合",
+      _source: "netease",
+    };
+    if (
+      ["S", "N", "O", "H"].includes(item.ToplistType) ||
+      officialNames.includes(item.name)
+    ) {
+      official.push(entry);
+    } else {
+      special.push(entry);
+    }
+  }
+
+  const groups = [];
+  if (official.length > 0) {
+    groups.push({ title: "网易云音乐官方榜单", data: official });
+  }
+  if (special.length > 0) {
+    groups.push({ title: "网易云特色/全球榜", data: special });
+  }
+  return groups;
+}
+
+module.exports = {
+  fetchRemoteLrcIfNeeded,
+  isUsableLyricText,
+  firstValidResult,
+  findSourceByMeta,
+  tryFinalizeMediaResult,
+  resolveLyricCore,
+  groupNeteaseTopLists,
+  withTimeout,
+  searchWithStatusTimeout,
+  orderSourcesForPlayback,
+  raceSearchChunk,
+  resolveCandidatesMedia,
+  normalizeMediaSourceShared,
+  recordSearchLatency,
+  recordSourceSuccess,
+  recordSourceSoftFailure,
+  recordSourceFailure,
+  getSourceHealthState,
+};
+
+  },
   "./core/fallback-pure": function(module, exports, require, env, getUserVariables, __musicfree_require) {
 "use strict";
 
-const axios = require("axios");
+const { httpGet, parseBooleanFlag } = require("../utils/http");
 const { findBestMatch, cleanTitle, cleanArtist } = require("./matcher");
 const { formatDuration, parseDurationSeconds } = require("../utils/format");
 const {
@@ -3634,9 +6050,24 @@ const {
   ensureDynamicPluginsReady,
 } = require("./dynamic-loader");
 const { matchCache } = require("./cache");
+const { playbackSession } = require("./playback-session");
+const {
+  tryFinalizeMediaResult,
+  resolveLyricCore,
+  findSourceByMeta,
+  groupNeteaseTopLists,
+  orderSourcesForPlayback,
+  raceSearchChunk,
+  resolveCandidatesMedia,
+  normalizeMediaSourceShared,
+  recordSourceFailure,
+  recordSourceSoftFailure,
+} = require("./fallback-helpers");
 const {
   safeGetMediaSourceWithFallback,
   getQualityFallbackLadder,
+  isFatalNetworkError,
+  isInvalid404Url: checkInvalid404Url,
 } = require("./quality-fallback");
 
 // 纯净版：0 内置源
@@ -3714,12 +6145,13 @@ function isSourceBlacklisted(sourceKey, sourceName, blacklistSet) {
 /**
  * 获取完整排好序的动态音源列表 (支持 0ms 同步秒读与就绪锁保障)
  */
-async function getOrderedSources(env = {}) {
+async function getOrderedSources(env = {}, options = {}) {
+  const { skipSync = false, readyTimeoutMs = 8000 } = options || {};
   const sources = [];
   const blacklist = getBlacklistSet(env);
 
   // 1. 【前置就绪锁】：先确保本地持久化存储（localStorage + IndexedDB）全部恢复入内存！
-  await ensureDynamicPluginsReady(8000);
+  await ensureDynamicPluginsReady(readyTimeoutMs);
 
   // 2. 本地已就绪后，再视用户配置指纹是否变动决定是否需要网络同步
   const tier0Urls =
@@ -3737,7 +6169,7 @@ async function getOrderedSources(env = {}) {
     env.fallbackUrls ||
     "";
 
-  if (tier0Urls || tier3Urls) {
+  if (!skipSync && (tier0Urls || tier3Urls)) {
     try {
       await syncCustomPlugins(
         tier0Urls,
@@ -3963,11 +6395,13 @@ async function unifiedSearch(query, page = 1, type = "music", env = {}) {
         searchTargets[idx].key ||
         searchTargets[idx].platform ||
         sourceName;
+      const sourceUrl = searchTargets[idx]._sourceUrl || "";
       r.value.data.forEach((item) => {
         combined.push({
           ...item,
           duration: formatDuration(item.duration),
           _source: item._source || sourceKey,
+          _sourceUrl: item._sourceUrl || sourceUrl,
           _sourceName: sourceName,
           platform: "智能多源聚合",
         });
@@ -4013,152 +6447,26 @@ async function unifiedSearch(query, page = 1, type = "music", env = {}) {
 }
 
 function isInvalid404Url(url) {
-  if (!url || typeof url !== "string") return true;
-  return (
-    url.includes("/404.html") ||
-    url.includes("/404/") ||
-    url.endsWith("/404") ||
-    url.includes("music.163.com/404")
-  );
+  return checkInvalid404Url(url);
 }
-
-const AUDIO_EXTS = new Set([
-  "mp3", "flac", "m4a", "m4s", "aac", "ogg", "wav", "ape", "wma", "opus", "webm"
-]);
-const SCRIPT_EXTS = new Set([
-  "php", "jsp", "asp", "aspx", "do", "action", "cgi"
-]);
 
 /**
  * 智能规范化音频媒体源：修复 .php 脚本后缀、追踪 302 真实 CDN 跳转与补全音频后缀
  */
 async function normalizeMediaSource(mediaRes) {
-  if (!mediaRes || !mediaRes.url || typeof mediaRes.url !== "string") {
-    return null;
-  }
-
-  try {
-    const rawUrl = mediaRes.url.trim();
-    if (isInvalid404Url(rawUrl)) {
-      return null;
-    }
-
-    // 提取 pathname 中的后缀
-    const cleanPath = rawUrl.split("?")[0].split("#")[0];
-    const match = cleanPath.match(/\.([a-zA-Z0-9]+)$/);
-    const ext = match ? match[1].toLowerCase() : "";
-
-    // 1. 若已经是标准音频扩展名，0 延迟直接返回
-    if (AUDIO_EXTS.has(ext)) {
-      return mediaRes;
-    }
-
-    // 2. 若命中脚本后缀（如 .php）或无扩展名，启动轻量 302 追踪与流可用性探测
-    if (SCRIPT_EXTS.has(ext) || !ext) {
-      let finalUrl = rawUrl;
-      let contentType = "";
-      let isUnplayableAttachment = false;
-
-      try {
-        const probeRes = await axios.get(rawUrl, {
-          headers: mediaRes.headers || {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          },
-          maxRedirects: 5,
-          timeout: 2500,
-          responseType: "stream",
-        });
-
-        // 提取 302 重定向后的真实 responseUrl
-        if (
-          probeRes.request &&
-          probeRes.request.res &&
-          probeRes.request.res.responseUrl
-        ) {
-          finalUrl = probeRes.request.res.responseUrl;
-        } else if (probeRes.config && probeRes.config.url) {
-          finalUrl = probeRes.config.url;
-        }
-
-        if (probeRes.headers) {
-          contentType = (
-            probeRes.headers["content-type"] || ""
-          ).toLowerCase();
-          const disp = (
-            probeRes.headers["content-disposition"] || ""
-          ).toLowerCase();
-          // 若响应头带有 attachment 强制下载标记，或者返回 text/html 错误页，判定为不可流式播放的假直链
-          if (disp.includes("attachment") || contentType.includes("text/html")) {
-            isUnplayableAttachment = true;
-          }
-        }
-
-        if (probeRes.data && typeof probeRes.data.destroy === "function") {
-          probeRes.data.destroy();
-        }
-      } catch (probeErr) {
-        // 探测失败
-      }
-
-      // 若探测出 attachment 强制下载标记或返回 html 错误页，判定为不可流式播放
-      if (isUnplayableAttachment) {
-        return null;
-      }
-
-      // 检查追踪后的 URL 是否带有标准音频后缀
-      const finalCleanPath = finalUrl.split("?")[0].split("#")[0];
-      const finalMatch = finalCleanPath.match(/\.([a-zA-Z0-9]+)$/);
-      const finalExt = finalMatch ? finalMatch[1].toLowerCase() : "";
-
-      if (AUDIO_EXTS.has(finalExt)) {
-        return {
-          ...mediaRes,
-          url: finalUrl,
-        };
-      }
-
-      // 若追踪后仍无音频后缀或仍为脚本路径，根据 Content-Type 或默认 mp3 修正
-      let targetExt = "mp3";
-      if (contentType.includes("flac")) targetExt = "flac";
-      else if (
-        contentType.includes("mp4") ||
-        contentType.includes("m4a") ||
-        contentType.includes("aac")
-      )
-        targetExt = "m4a";
-      else if (contentType.includes("ogg")) targetExt = "ogg";
-      else if (contentType.includes("wav")) targetExt = "wav";
-
-      const fixedUrl = finalUrl.includes("?")
-        ? `${finalUrl}&_ext=.${targetExt}`
-        : `${finalUrl}?_ext=.${targetExt}`;
-
-      return {
-        ...mediaRes,
-        url: fixedUrl,
-        _inferredExt: targetExt,
-      };
-    }
-  } catch (err) {
-    // 异常安全兜底
-  }
-
-  return mediaRes;
+  return normalizeMediaSourceShared(mediaRes, isInvalid404Url);
 }
 
 /**
- * 纯净版自动换源调度 (全量 30+ 源完整容灾)
+ * 纯净版自动换源调度 (高敏竞速 + 健康熔断 + 记忆秒开)
  */
 async function resolveMediaSourceWithFallback(
   musicItem,
   quality = "standard",
   env = {}
 ) {
-  const allowDowngrade =
-    env.autoQualityDowngrade !== "false" && env.autoQualityDowngrade !== false;
-  const enableCache =
-    env.enableMatchCache !== "false" && env.enableMatchCache !== false;
+  const allowDowngrade = parseBooleanFlag(env.autoQualityDowngrade, true);
+  const enableCache = parseBooleanFlag(env.enableMatchCache, true);
 
   const target = {
     title: musicItem.title || "",
@@ -4173,315 +6481,222 @@ async function resolveMediaSourceWithFallback(
     throw new Error("歌曲元数据不足，无法进行自动换源检索");
   }
 
-  // Step 0: 检查换源记忆表 (10ms 秒开)
-  if (enableCache) {
-    const cachedMatch = matchCache.get(target.title, target.artist);
-    if (cachedMatch && cachedMatch.sourceKey) {
-      let cachedSource = null;
-      for (const reg of dynamicRegistry.values()) {
-        if (
-          reg.plugin.key === cachedMatch.sourceKey ||
-          reg.plugin.platform === cachedMatch.sourceKey
-        ) {
-          cachedSource = reg.plugin;
-          break;
+  playbackSession.markResolving(target.title, target.artist);
+  try {
+    // Step 0: 检查换源记忆表 (10ms 秒开，桌面端先确保原生存储完成水合)
+    if (enableCache) {
+      await matchCache.ensureReady(50);
+      const cachedMatch = matchCache.get(target.title, target.artist);
+      const blacklist = getBlacklistSet(env);
+      const isMatchBlacklisted =
+        cachedMatch &&
+        isSourceBlacklisted(cachedMatch.sourceKey, cachedMatch.sourceName, blacklist);
+
+      if (cachedMatch && cachedMatch.sourceKey && !isMatchBlacklisted) {
+        if (dynamicRegistry.size === 0) {
+          await ensureDynamicPluginsReady(1000);
         }
-      }
+        const cachedKeyLower = String(cachedMatch.sourceKey).toLowerCase();
+        let cachedSource = null;
+        for (const reg of dynamicRegistry.values()) {
+          const p = reg && reg.plugin;
+          if (
+            p &&
+            (p.key === cachedMatch.sourceKey ||
+              p.platform === cachedMatch.sourceKey ||
+              p.name === cachedMatch.sourceKey ||
+              (p.key && p.key.toLowerCase() === cachedKeyLower) ||
+              (p.platform && p.platform.toLowerCase() === cachedKeyLower) ||
+              (p.name && p.name.toLowerCase() === cachedKeyLower))
+          ) {
+            cachedSource = p;
+            break;
+          }
+        }
 
-      if (cachedSource && typeof cachedSource.getMediaSource === "function") {
-        const fallbackRes = await safeGetMediaSourceWithFallback(
-          cachedSource,
-          cachedMatch.item,
-          quality,
-          allowDowngrade
-        );
+        if (
+          cachedSource &&
+          typeof cachedSource.getMediaSource === "function" &&
+          !isSourceBlacklisted(
+            cachedSource.key,
+            cachedSource.platform || cachedSource.name,
+            blacklist
+          )
+        ) {
+          const fallbackRes = await safeGetMediaSourceWithFallback(
+            cachedSource,
+            cachedMatch.item,
+            quality,
+            allowDowngrade
+          );
 
-        if (fallbackRes && fallbackRes.mediaRes) {
-          const normRes = await normalizeMediaSource(fallbackRes.mediaRes);
-          return {
-            ...normRes,
-            platform: "智能多源聚合",
-            _sourceUsed: cachedSource.name || cachedMatch.sourceKey,
-            _fromMemoryCache: true,
-            _matchedSong: `${cachedMatch.item.title} - ${cachedMatch.item.artist}`,
-          };
-        } else {
+          const finalized =
+            fallbackRes && fallbackRes.mediaRes
+              ? await tryFinalizeMediaResult({
+                  rawMediaRes: fallbackRes.mediaRes,
+                  normalizeMediaSource,
+                  isInvalid404Url,
+                  matchCache,
+                  playbackSession,
+                  target,
+                  sourceObj: cachedSource,
+                  origSourceKey: cachedMatch.sourceKey,
+                  isFallback: !!cachedMatch.isFallback,
+                  enableCache: false,
+                  defaultDisplayName:
+                    cachedMatch.sourceName || cachedMatch.sourceKey,
+                  sourceNameOverride: cachedMatch.sourceName,
+                })
+              : null;
+
+          if (finalized) {
+            return {
+              ...finalized,
+              _fromMemoryCache: true,
+              _matchedSong: `${cachedMatch.item.title} - ${cachedMatch.item.artist}`,
+            };
+          }
           matchCache.invalidate(target.title, target.artist);
         }
       }
     }
-  }
 
-  // -------------------------------------------------------------
-  // Step 0: 原生源优先直连 (若曲目自带有效 _source 且已加载，优先尝试)
-  // -------------------------------------------------------------
-  const orderedSources = await getOrderedSources(env);
-  if (orderedSources.length === 0) {
-    throw new Error("当前纯净版未加载任何可用音源，请先在设置中填入音源插件链接");
-  }
+    // -------------------------------------------------------------
+    // Step 0.5: 原生源优先直连 (若曲目自带有效 _source 且已加载，优先尝试)
+    // -------------------------------------------------------------
+    const orderedSources = await getOrderedSources(env);
+    if (orderedSources.length === 0) {
+      throw new Error("当前纯净版未加载任何可用音源，请先在设置中填入音源插件链接");
+    }
 
-  const origSourceKey = (musicItem._source || "").toLowerCase();
-  let primaryTriedAndFailed = false;
+    const origSourceKey = (musicItem._source || "").toLowerCase();
+    const songSoftFailedSources = new Set();
+    let origSource = null;
+    let primaryTriedAndFailed = false;
 
-  if (origSourceKey) {
-    const origSource = orderedSources.find(
-      (s) => (s.key && s.key.toLowerCase() === origSourceKey) ||
-             (s.platform && s.platform.toLowerCase() === origSourceKey) ||
-             (s.name && s.name.toLowerCase() === origSourceKey)
-    );
-
-    if (origSource && typeof origSource.getMediaSource === "function") {
-      const fallbackRes = await safeGetMediaSourceWithFallback(
-        origSource,
-        musicItem,
-        quality,
-        allowDowngrade
+    if (origSourceKey || musicItem._sourceUrl) {
+      origSource = findSourceByMeta(
+        orderedSources,
+        builtInSources,
+        origSourceKey,
+        musicItem._sourceUrl
       );
 
-      if (fallbackRes && fallbackRes.mediaRes) {
-        const normRes = await normalizeMediaSource(fallbackRes.mediaRes);
-        if (normRes && normRes.url && !isInvalid404Url(normRes.url)) {
-          return {
-            ...normRes,
-            platform: "智能多源聚合",
-            _sourceUsed: origSource.name || origSource.platform || origSourceKey,
-          };
-        }
-      }
-      primaryTriedAndFailed = true;
-    }
-  }
-
-  // -------------------------------------------------------------
-  // Step 1: 分梯队高速并发竞速换源 (第一梯队 Top 6 源并行搜索，0.8s 极速出声)
-  // -------------------------------------------------------------
-  const queryStr = artistClean ? `${titleClean} ${artistClean}` : titleClean;
-  const CHUNK_SIZE = 6; // 每批并发 6 个优质音源
-  const chunks = [];
-  for (let i = 0; i < orderedSources.length; i += CHUNK_SIZE) {
-    chunks.push(orderedSources.slice(i, i + CHUNK_SIZE));
-  }
-
-  for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
-    const chunkSources = chunks[chunkIdx];
-
-    // 6 路并发并行搜索 (单次 1600ms 快速熔断)
-    const searchTasks = chunkSources.map(async (source) => {
-      if (
-        typeof source.search !== "function" ||
-        typeof source.getMediaSource !== "function"
-      ) {
-        return null;
-      }
-      try {
-        const res = await searchWithTimeout(source, queryStr, 1, "music", 1600);
-        let list = res && Array.isArray(res.data) ? res.data : [];
-        if (list.length === 0 && artistClean) {
-          const fallbackRes = await searchWithTimeout(
-            source,
-            titleClean,
-            1,
-            "music",
-            1200
-          );
-          if (fallbackRes && Array.isArray(fallbackRes.data))
-            list = fallbackRes.data;
-        }
-
-        if (list.length > 0) {
-          const match = findBestMatch(target, list, 55);
-          if (match) {
-            return {
-              source,
-              bestMatch: match,
-              score: match._matchScore || 0,
-            };
-          }
-        }
-      } catch (e) {}
-      return null;
-    });
-
-    const searchResults = await Promise.allSettled(searchTasks);
-    const validMatches = [];
-    for (const r of searchResults) {
-      if (r.status === "fulfilled" && r.value) {
-        validMatches.push(r.value);
-      }
-    }
-
-    if (validMatches.length > 0) {
-      // 按照匹配得分从高到低排序，原唱优先
-      validMatches.sort((a, b) => b.score - a.score);
-      const candidates = validMatches.slice(0, 3);
-
-      // =============================================================
-      // 第一轮：严格高音质匹配（绝不无脑降级！）
-      // 对所有候选源先统一请求用户/客户端指定的 quality
-      // 只要全网任意源能提供该目标音质，直接输出，100% 满足高音质诉求！
-      // =============================================================
-      for (const candidate of candidates) {
+      if (origSource && typeof origSource.getMediaSource === "function") {
+        let fallbackRes = null;
+        let origFatal = false;
         try {
-          const mediaRes = await candidate.source.getMediaSource(
-            candidate.bestMatch,
-            quality
+          fallbackRes = await safeGetMediaSourceWithFallback(
+            origSource,
+            musicItem,
+            quality,
+            allowDowngrade,
+            2800,
+            {
+              onFatalError: () => {
+                origFatal = true;
+              },
+            }
           );
-          if (
-            mediaRes &&
-            mediaRes.url &&
-            mediaRes.url.startsWith("http") &&
-            !isInvalid404Url(mediaRes.url)
-          ) {
-            if (enableCache) {
-              const sKey =
-                candidate.source.key ||
-                candidate.source.platform ||
-                candidate.source.name ||
-                "unknown";
-              matchCache.set(
-                target.title,
-                target.artist,
-                sKey,
-                candidate.bestMatch
-              );
-            }
+        } catch (origErr) {
+          if (isFatalNetworkError(origErr)) origFatal = true;
+        }
 
-            const normRes = await normalizeMediaSource(mediaRes);
-            if (normRes && normRes.url && !isInvalid404Url(normRes.url)) {
-              return {
-                ...normRes,
-                platform: "智能多源聚合",
-                _sourceUsed:
-                  candidate.source.name ||
-                  candidate.source.platform ||
-                  "动态源",
-                _matchedSong: `${candidate.bestMatch.title} - ${candidate.bestMatch.artist}`,
-                _matchScore: candidate.bestMatch._matchScore,
-              };
-            }
-          }
-        } catch (mediaErr) {}
+        if (fallbackRes && fallbackRes.mediaRes) {
+          const finalized = await tryFinalizeMediaResult({
+            rawMediaRes: fallbackRes.mediaRes,
+            normalizeMediaSource,
+            isInvalid404Url,
+            matchCache,
+            playbackSession,
+            target,
+            sourceObj: origSource,
+            origSourceKey,
+            isFallback: false,
+            enableCache: false,
+          });
+          if (finalized) return finalized;
+        }
+
+        if (origFatal) {
+          recordSourceFailure(origSource, true);
+        } else if (!songSoftFailedSources.has(origSource)) {
+          songSoftFailedSources.add(origSource);
+          recordSourceSoftFailure(origSource);
+        }
+        primaryTriedAndFailed = true;
       }
+    }
 
-      // =============================================================
-      // 第二轮：次级阶梯降级（全网穷尽第一轮后才触发）
-      // 仅当全网高分源均无法提供目标音质，且允许降级时，
-      // 才单向向下按梯队（如 super ➔ high ➔ standard ➔ low）平滑下潜保底出声
-      // =============================================================
-      if (allowDowngrade) {
-        const ladder = getQualityFallbackLadder(quality, true).slice(1); // 排除第一轮已尝试的 quality
-        for (const fallbackQuality of ladder) {
-          for (const candidate of candidates) {
-            try {
-              const mediaRes = await candidate.source.getMediaSource(
-                candidate.bestMatch,
-                fallbackQuality
-              );
-              if (
-                mediaRes &&
-                mediaRes.url &&
-                mediaRes.url.startsWith("http") &&
-                !isInvalid404Url(mediaRes.url)
-              ) {
-                if (enableCache) {
-                  const sKey =
-                    candidate.source.key ||
-                    candidate.source.platform ||
-                    candidate.source.name ||
-                    "unknown";
-                  matchCache.set(
-                    target.title,
-                    target.artist,
-                    sKey,
-                    candidate.bestMatch
-                  );
-                }
+    // -------------------------------------------------------------
+    // Step 1: 过滤并重排可播音乐源 -> 分梯队早退竞速换源（命中即出链，不傻等死源超时）
+    // -------------------------------------------------------------
+    const queryStr = artistClean ? `${titleClean} ${artistClean}` : titleClean;
+    const playableSources = orderSourcesForPlayback(orderedSources, target).filter(
+      (s) => !(primaryTriedAndFailed && origSource && s === origSource)
+    );
 
-                const normRes = await normalizeMediaSource(mediaRes);
-                return {
-                  ...normRes,
-                  platform: "智能多源聚合",
-                  _sourceUsed:
-                    candidate.source.name ||
-                    candidate.source.platform ||
-                    "动态源",
-                  _matchedSong: `${candidate.bestMatch.title} - ${candidate.bestMatch.artist}`,
-                  _matchScore: candidate.bestMatch._matchScore,
-                };
-              }
-            } catch (mediaErr) {}
-          }
+    const CHUNK_SIZE = 6;
+    for (let i = 0; i < playableSources.length; i += CHUNK_SIZE) {
+      const chunkSources = playableSources.slice(i, i + CHUNK_SIZE);
+      const raceResult = await raceSearchChunk({
+        chunkSources,
+        queryStr,
+        titleClean,
+        artistClean,
+        target,
+        findBestMatch,
+      });
+
+      if (raceResult.matches.length > 0 || !raceResult.settledAll) {
+        if (raceResult.matches.length > 0) {
+          const hit = await resolveCandidatesMedia({
+            raceResult,
+            quality,
+            allowDowngrade,
+            normalizeMediaSource,
+            isInvalid404Url,
+            matchCache,
+            playbackSession,
+            target,
+            enableCache,
+            defaultDisplayName: "动态源",
+            softFailedSourcesSet: songSoftFailedSources,
+          });
+          if (hit) return hit;
         }
       }
     }
-  }
 
-  throw new Error(
-    `已加载的动态音源均无法播放歌曲: ${target.title} - ${target.artist}`
-  );
+    throw new Error(
+      `已加载的动态音源均无法播放歌曲: ${target.title} - ${target.artist}`
+    );
+  } finally {
+    playbackSession.unmarkResolving(target.title, target.artist);
+  }
 }
 
 /**
- * 纯净版歌词自动补全
+ * 纯净版歌词自动补全（仅等待本地快速恢复与过滤黑名单，绝不阻塞在远程合集全量下载上）
  */
 async function resolveLyricWithFallback(musicItem, env = {}) {
-
-  // 0. 优先检查定向歌词项或直接携带的 rawLrc (如搜索歌词弹窗中点击选中的条目)
-  const { resolveDirectLyricItem } = require("./lyric-searcher");
-  const dynamicSources = getActiveDynamicPlugins("tier0").concat(getActiveDynamicPlugins("tier3"));
-  const directLrc = await resolveDirectLyricItem(musicItem, {}, dynamicSources);
-  if (directLrc && directLrc.rawLrc && directLrc.rawLrc.trim().length > 10) {
-    return directLrc;
-  }
-  const orderedSources = await getOrderedSources(env);
-  const target = {
-    title: musicItem.title || "",
-    artist: musicItem.artist || "",
-    duration: musicItem.duration || 0,
-  };
-  const titleClean = cleanTitle(target.title);
-  const artistClean = cleanArtist(target.artist);
-
-  for (const source of orderedSources) {
-    if (typeof source.getLyric !== "function") continue;
-    try {
-      let candidateList = [];
-      if (artistClean) {
-        const r1 = await searchWithTimeout(
-          source,
-          `${titleClean} ${artistClean}`,
-          1,
-          "music",
-          1200
-        );
-        if (r1 && Array.isArray(r1.data) && r1.data.length > 0)
-          candidateList = r1.data;
-      }
-      if (candidateList.length === 0) {
-        const r2 = await searchWithTimeout(
-          source,
-          titleClean,
-          1,
-          "music",
-          1200
-        );
-        if (r2 && Array.isArray(r2.data) && r2.data.length > 0)
-          candidateList = r2.data;
-      }
-
-      if (candidateList.length > 0) {
-        const bestMatch = findBestMatch(target, candidateList, 55);
-        if (bestMatch) {
-          const lrcRes = await source.getLyric(bestMatch);
-          if (lrcRes && lrcRes.rawLrc && lrcRes.rawLrc.trim().length > 10) {
-            return lrcRes;
-          }
-        }
-      }
-    } catch (e) {}
-  }
-
-  return { rawLrc: "" };
+  const orderedSources = await getOrderedSources(env, {
+    skipSync: true,
+    readyTimeoutMs: 600,
+  });
+  return await resolveLyricCore({
+    musicItem,
+    env,
+    builtInSources: {},
+    dynamicSources: orderedSources,
+    orderedSources,
+    findBestMatch,
+    cleanTitle,
+    cleanArtist,
+    searchWithTimeout,
+    playbackSession,
+    matchCache,
+  });
 }
 
 /**
@@ -4530,6 +6745,19 @@ async function resolveTopLists(env = {}) {
               ? res.map((group) => ({
                   ...group,
                   title: `[动态源] ${group.title || source.platform || source.name || "自定义榜单"}`,
+                  data: Array.isArray(group?.data)
+                    ? group.data.map((t) => ({
+                        ...t,
+                        platform: "智能多源聚合",
+                        _source:
+                          t._source ||
+                          source.key ||
+                          source.platform ||
+                          source.name ||
+                          "",
+                        _sourceUrl: t._sourceUrl || source._sourceUrl || "",
+                      }))
+                    : [],
                 }))
               : [],
           3000
@@ -4564,56 +6792,27 @@ async function resolveTopLists(env = {}) {
     ])
   );
 
-  // 3. 网易云官方榜单 (使用 http://music.163.com 避开 Node/Electron TLS 握手异常)
+  // 3. 网易云官方榜单
   tasks.push(
     safeTopListTask(
       () =>
-        axios.get("http://music.163.com/api/toplist", {
+        httpGet("https://music.163.com/api/toplist", {
           headers: {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            Referer: "http://music.163.com/",
+            Referer: "https://music.163.com/",
           },
           timeout: 3000,
         }),
-      (res) => {
-        const list = res.data?.list || [];
-        const official = [];
-        const special = [];
-
-        list.forEach((item) => {
-          const entry = {
-            id: `ne_${item.id}`,
-            sheetId: item.id,
-            title: item.name,
-            artwork: item.coverImgUrl,
-            description: item.description || "",
-            platform: "智能多源聚合",
-            _source: "netease",
-          };
-          if (
-            ["S", "N", "O", "H"].includes(item.ToplistType) ||
-            ["云音乐飙升榜", "云音乐新歌榜", "网易原创歌曲榜", "云音乐热歌榜"].includes(item.name)
-          ) {
-            official.push(entry);
-          } else {
-            special.push(entry);
-          }
-        });
-
-        const groups = [];
-        if (official.length > 0) groups.push({ title: "网易云音乐官方榜单", data: official });
-        if (special.length > 0) groups.push({ title: "网易云特色/全球榜", data: special });
-        return groups;
-      },
+      (res) => groupNeteaseTopLists(res.data?.list || [], "ne_"),
       3000
     )
   );
 
-  // 4. QQ音乐官方榜单 (使用 http://c.y.qq.com 避开 Node/Electron TLS 握手异常)
+  // 4. QQ音乐官方榜单
   tasks.push(
     safeTopListTask(
       () =>
-        axios.get("http://c.y.qq.com/v8/fcg-bin/fcg_myqq_toplist.fcg", {
+        httpGet("https://c.y.qq.com/v8/fcg-bin/fcg_myqq_toplist.fcg", {
           params: {
             format: "json",
             g_tk: 5381,
@@ -4624,7 +6823,7 @@ async function resolveTopLists(env = {}) {
             platform: "h5",
             needNewCode: 1,
           },
-          headers: { Referer: "http://y.qq.com/" },
+          headers: { Referer: "https://y.qq.com/" },
           timeout: 3000,
         }),
       (res) => {
@@ -4653,10 +6852,13 @@ async function resolveTopLists(env = {}) {
     if (item.status === "fulfilled" && Array.isArray(item.value)) {
       for (const group of item.value) {
         if (group && Array.isArray(group.data) && group.data.length > 0) {
-          group.data.forEach((t) => {
-            t.platform = "智能多源聚合";
+          results.push({
+            ...group,
+            data: group.data.map((t) => ({
+              ...t,
+              platform: "智能多源聚合",
+            })),
           });
-          results.push(group);
         }
       }
     }
@@ -4675,7 +6877,7 @@ async function resolveTopListDetail(topListItem, env = {}) {
   if (topListItem._source === "kuwo" || String(topListItem.id).startsWith("kw_")) {
     const cleanId = rawId.replace("kw_", "");
     try {
-      const res = await axios.get("http://kbangserver.kuwo.cn/ksong.s", {
+      const res = await httpGet("https://kbangserver.kuwo.cn/ksong.s", {
         params: {
           from: "pc",
           fmt: "json",
@@ -4715,7 +6917,7 @@ async function resolveTopListDetail(topListItem, env = {}) {
   if (topListItem._source === "qq" || String(topListItem.id).startsWith("qq_")) {
     const cleanId = rawId.replace("qq_", "");
     try {
-      const res = await axios.get("http://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_cp.fcg", {
+      const res = await httpGet("https://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_cp.fcg", {
         params: {
           g_tk: 5381,
           uin: 0,
@@ -4732,7 +6934,7 @@ async function resolveTopListDetail(topListItem, env = {}) {
           song_begin: 0,
           song_num: 50,
         },
-        headers: { Referer: "http://y.qq.com/" },
+        headers: { Referer: "https://y.qq.com/" },
         timeout: 6000,
       });
       const songlist = res.data?.songlist || [];
@@ -4764,13 +6966,13 @@ async function resolveTopListDetail(topListItem, env = {}) {
   if (topListItem._source === "netease" || String(topListItem.id).startsWith("ne_")) {
     const cleanId = rawId.replace("ne_", "");
     try {
-      const res = await axios.get(
-        `http://music.163.com/api/v6/playlist/detail?id=${cleanId}`,
+      const res = await httpGet(
+        `https://music.163.com/api/v6/playlist/detail?id=${cleanId}`,
         {
           headers: {
             "User-Agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            Referer: "http://music.163.com/",
+            Referer: "https://music.163.com/",
           },
           timeout: 6000,
         }
@@ -4795,9 +6997,25 @@ async function resolveTopListDetail(topListItem, env = {}) {
     } catch (e) {}
   }
 
-  // 4. 动态插件榜单详情获取
+  // 4. 动态插件榜单详情获取（优先精准匹配 _sourceUrl 唯一线路，再按 _source 匹配 key/platform/name）
   const orderedSources = await getOrderedSources(env);
-  for (const source of orderedSources) {
+  const targetUrl = topListItem._sourceUrl || "";
+  const targetSourceKey = (topListItem._source || "").toLowerCase();
+
+  const matchesByUrl = (s) => targetUrl && s._sourceUrl === targetUrl;
+  const matchesByKey = (s) =>
+    !!targetSourceKey &&
+    ((s.key && s.key.toLowerCase() === targetSourceKey) ||
+      (s.platform && s.platform.toLowerCase() === targetSourceKey) ||
+      (s.name && s.name.toLowerCase() === targetSourceKey));
+
+  const prioritizedSources = [
+    ...orderedSources.filter((s) => matchesByUrl(s)),
+    ...orderedSources.filter((s) => !matchesByUrl(s) && matchesByKey(s)),
+    ...orderedSources.filter((s) => !matchesByUrl(s) && !matchesByKey(s)),
+  ];
+
+  for (const source of prioritizedSources) {
     if (typeof source.getTopListDetail === "function") {
       try {
         const res = await Promise.resolve(source.getTopListDetail(topListItem));
@@ -4896,15 +7114,15 @@ async function resolveRecommendSheetsByTag(tag, page = 1) {
   const offset = (page - 1) * limit;
 
   try {
-    const res = await axios.get(
-      `http://music.163.com/api/playlist/list?cat=${encodeURIComponent(
+    const res = await httpGet(
+      `https://music.163.com/api/playlist/list?cat=${encodeURIComponent(
         cat
       )}&limit=${limit}&offset=${offset}&order=hot`,
       {
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          Referer: "http://music.163.com/",
+          Referer: "https://music.163.com/",
         },
         timeout: 8000,
       }
@@ -4937,13 +7155,13 @@ async function resolveMusicSheetInfo(sheetItem, page = 1) {
   // 1. 尝试直接通过 ID 获取网易云歌单
   if (sheetItem.id) {
     try {
-      const apiRes = await axios.get(
-        `http://music.163.com/api/v6/playlist/detail?id=${sheetItem.id}`,
+      const apiRes = await httpGet(
+        `https://music.163.com/api/v6/playlist/detail?id=${sheetItem.id}`,
         {
           headers: {
             "User-Agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            Referer: "http://music.163.com/",
+            Referer: "https://music.163.com/",
           },
           timeout: 8000,
         }
@@ -4978,20 +7196,20 @@ async function resolveMusicSheetInfo(sheetItem, page = 1) {
   // 2. 安全兜底：通过歌单标题在网易云精确检索
   if ((!res || !Array.isArray(res.musicList) || res.musicList.length === 0) && sheetItem.title) {
     try {
-      const searchRes = await axios.get("http://music.163.com/api/search/get/web", {
+      const searchRes = await httpGet("https://music.163.com/api/search/get/web", {
         params: { s: sheetItem.title, type: 1000, limit: 1 },
         headers: { "User-Agent": "Mozilla/5.0" },
         timeout: 8000,
       });
       const exactSheet = searchRes.data?.result?.playlists?.[0];
       if (exactSheet && exactSheet.id) {
-        const detailRes = await axios.get(
-          `http://music.163.com/api/v6/playlist/detail?id=${exactSheet.id}`,
+        const detailRes = await httpGet(
+          `https://music.163.com/api/v6/playlist/detail?id=${exactSheet.id}`,
           {
             headers: {
               "User-Agent":
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-              Referer: "http://music.163.com/",
+              Referer: "https://music.163.com/",
             },
             timeout: 8000,
           }
@@ -5035,7 +7253,7 @@ async function resolveAlbumInfo(albumItem, page = 1) {
   // 1. 尝试直接按 ID 获取
   if (albumItem.id) {
     try {
-      const apiRes = await axios.get(
+      const apiRes = await httpGet(
         `https://music.163.com/api/v1/album/${albumItem.id}`,
         {
           headers: {
@@ -5064,14 +7282,14 @@ async function resolveAlbumInfo(albumItem, page = 1) {
   if ((!res || !Array.isArray(res.musicList) || res.musicList.length === 0) && albumItem.title) {
     try {
       const q = `${albumItem.title} ${albumItem.artist || ""}`.trim();
-      const searchRes = await axios.get("https://music.163.com/api/search/get/web", {
+      const searchRes = await httpGet("https://music.163.com/api/search/get/web", {
         params: { s: q, type: 10, limit: 1 },
         headers: { "User-Agent": "Mozilla/5.0" },
         timeout: 8000,
       });
       const exactAlbum = searchRes.data?.result?.albums?.[0];
       if (exactAlbum && exactAlbum.id) {
-        const detailRes = await axios.get(
+        const detailRes = await httpGet(
           `https://music.163.com/api/v1/album/${exactAlbum.id}`,
           {
             headers: {
@@ -5110,7 +7328,7 @@ async function resolveArtistWorks(artistItem, page = 1, type = "music") {
   if (artistItem.id) {
     try {
       if (type === "music") {
-        const apiRes = await axios.get(
+        const apiRes = await httpGet(
           `https://music.163.com/api/v1/artist/${artistItem.id}`,
           {
             headers: {
@@ -5137,7 +7355,7 @@ async function resolveArtistWorks(artistItem, page = 1, type = "music") {
       if (type === "album") {
         const limit = 20;
         const offset = (page - 1) * limit;
-        const apiRes = await axios.get(
+        const apiRes = await httpGet(
           `https://music.163.com/api/artist/albums/${artistItem.id}`,
           {
             params: { limit, offset },
@@ -5169,7 +7387,7 @@ async function resolveArtistWorks(artistItem, page = 1, type = "music") {
   // 2. 安全兜底：通过歌手名称在网易云精确检索真实歌手 ID
   if ((!res || !Array.isArray(res.data) || res.data.length === 0) && artistItem.name) {
     try {
-      const searchRes = await axios.get("https://music.163.com/api/search/get/web", {
+      const searchRes = await httpGet("https://music.163.com/api/search/get/web", {
         params: { s: artistItem.name, type: 100, limit: 5 },
         headers: { "User-Agent": "Mozilla/5.0" },
         timeout: 8000,
@@ -5180,7 +7398,7 @@ async function resolveArtistWorks(artistItem, page = 1, type = "music") {
 
       if (exactArtist && exactArtist.id) {
         if (type === "music") {
-          const detailRes = await axios.get(
+          const detailRes = await httpGet(
             `https://music.163.com/api/v1/artist/${exactArtist.id}`,
             {
               headers: {
@@ -5205,7 +7423,7 @@ async function resolveArtistWorks(artistItem, page = 1, type = "music") {
         if (type === "album") {
           const limit = 20;
           const offset = (page - 1) * limit;
-          const detailRes = await axios.get(
+          const detailRes = await httpGet(
             `https://music.163.com/api/artist/albums/${exactArtist.id}`,
             {
               params: { limit, offset },
@@ -5260,6 +7478,7 @@ module.exports = {
   getOrderedSources,
   builtInSources,
   matchCache,
+  playbackSession,
   getBlacklistSet,
 };
 
@@ -5282,9 +7501,11 @@ const {
   resolveArtistWorks,
   getOrderedSources,
   builtInSources,
+  playbackSession,
 } = require("./core/fallback-pure");
 const {
   registerOrUpdatePlugin,
+  registerPluginBatch,
   updateAllRegisteredPlugins,
   deleteDynamicPlugin,
   clearAllDynamicPlugins,
@@ -5447,8 +7668,15 @@ const plugin = {
    * 动态多源容灾与自动换源播放
    */
   async getMediaSource(musicItem, quality = "standard") {
-    const userEnv = await getUserEnv(this);
-    return await resolveMediaSourceWithFallback(musicItem, quality, userEnv);
+    const title = (musicItem && musicItem.title) || "";
+    const artist = (musicItem && musicItem.artist) || "";
+    playbackSession.markResolving(title, artist);
+    try {
+      const userEnv = await getUserEnv(this);
+      return await resolveMediaSourceWithFallback(musicItem, quality, userEnv);
+    } finally {
+      playbackSession.unmarkResolving(title, artist);
+    }
   },
 
   /**
@@ -5546,13 +7774,26 @@ const plugin = {
         id: "source_summary_status",
         title: `[存储看板] 本地活跃: ${activeSources.length} 个音源 · 多轨存储: 原生磁盘 + IndexedDB + localStorage`,
         artist: diag.lastSyncTime > 0
-          ? `最近网络同步: ${diag.lastSyncStatus === "success" ? "成功" : "部分异常"} | 失败源: ${diag.failedPlugins.length} 个`
+          ? `最近网络同步: ${diag.lastSyncStatus === "success" ? "成功" : diag.lastSyncStatus === "partial" ? `部分成功 (${diag.successCount}/${diag.totalSubPlugins})` : "异常"} | 失败源: ${diag.failedPlugins.length} 个`
           : `本地持久化状态: 正常 · 纯本地秒开`,
         album: `💡 提示: 输入 'update' 检查更新，输入 'del 音源名' 删除`,
         artwork: config.defaultArtwork,
         duration: 0,
         platform: config.platform,
       });
+
+      const quotaInfo = storage.getQuotaStatus ? storage.getQuotaStatus() : null;
+      if (quotaInfo && quotaInfo.exceeded) {
+        items.push({
+          id: "storage_quota_warning",
+          title: "⚠️ [宿主存储配额已满] 历史插件缓存占满 MusicFree 10MB 上限",
+          artist: "建议关闭客户端后清理或删除旧版本残留 chunk.json 以恢复跨重启秒开记忆",
+          album: "存储路径: %APPDATA%/MusicFree/musicfree-plugin-storage/chunk.json",
+          artwork: config.defaultArtwork,
+          duration: 0,
+          platform: config.platform,
+        });
+      }
 
       const inheritInfo = storage.getInheritInfo ? storage.getInheritInfo() : null;
       if (inheritInfo && inheritInfo.inherited) {
@@ -5663,7 +7904,7 @@ const plugin = {
           id: "delete_feedback_item",
           title: delRes.message,
           artist: delRes.success
-            ? `已从本地硬盘 (localStorage) 与当前运行内存中永久移除`
+            ? `已从本地持久化存储与当前运行内存中永久移除`
             : `提示: 请输入 status 查看看板获取准确音源名称`,
           album: `状态: ${delRes.success ? "DELETED" : "NOT_FOUND"}`,
           artwork: config.defaultArtwork,
@@ -5680,12 +7921,17 @@ const plugin = {
       text === "秒开表" ||
       text === "缓存"
     ) {
+      await matchCache.ensureReady(100);
       const stats = matchCache.getStats();
+      const storageLabel =
+        typeof localStorage === "undefined"
+          ? `musicfree/storage[${stats.storageKey}]`
+          : `localStorage[${stats.storageKey}]`;
       return [
         {
           id: "cache_stats_item",
           title: `[换源秒开记忆看板] 已本地记忆 ${stats.count} 首曲目直达`,
-          artist: `本地持久化占用: ${stats.sizeKb} KB · 存储位置: localStorage[${stats.storageKey}]`,
+          artist: `本地持久化占用: ${stats.sizeKb} KB · 存储位置: ${storageLabel}`,
           album: `💡 提示: 输入 'clearcache' 或 '清空记忆' 可重置秒开缓存`,
           artwork: config.defaultArtwork,
           duration: 0,
@@ -5700,6 +7946,7 @@ const plugin = {
       text === "清空记忆" ||
       text === "重置记忆"
     ) {
+      await matchCache.ensureReady(100);
       const count = matchCache.size();
       matchCache.clear();
       return [
@@ -5777,13 +8024,7 @@ const plugin = {
 
         if (parsed && (Array.isArray(parsed.plugins) || (Array.isArray(parsed) && parsed[0]?.url))) {
           const list = Array.isArray(parsed.plugins) ? parsed.plugins : parsed;
-          let addedCount = 0;
-          for (const item of list) {
-            if (item.url && item.url.startsWith("http")) {
-              const r = await registerOrUpdatePlugin(item.url, "tier0", builtInSources);
-              if (r.status === "added" || r.status === "updated") addedCount++;
-            }
-          }
+          const { addedCount } = await registerPluginBatch(list, "tier0", builtInSources);
           return [
             {
               id: "json_paste_feedback",
@@ -5867,6 +8108,9 @@ module.exports = plugin;
       var combined = currentDir + "/" + requestedPath;
       var norm = "./" + normalizePath(combined);
       if (modules[norm]) return norm;
+      if (norm === "./config" && !modules[norm] && modules["./config-pure"]) {
+        return "./config-pure";
+      }
       if (modules[norm + ".js"]) return norm + ".js";
       return norm;
     }

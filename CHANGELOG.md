@@ -4,6 +4,46 @@
 
 ---
 
+## [v1.7.0] - 2026-11-25
+
+> ⚡ **极速并发换源、切歌歌词秒同步、音源显示隔离与全端 HTTP/TLS 容错升级**：重构多源搜索与试听调度为优先级分梯队并发竞速，消除未知歌曲 3~4 秒卡顿与切歌歌词延迟；彻底隔离歌词切换与多曲切换时的播放音源会话，并补齐桌面/移动端持久化和 TLS 自动回退能力。
+
+---
+
+### 🚀 1. 并发换源调度与切歌歌词秒同步 (`perf(fallback)`)
+1. **分梯队早期退出并发搜源与 Top-3 并发取流**：
+   - 新增 `orderSourcesForPlayback`、`raceSearchChunk` 与 `fetchBestCandidateAtQuality` / `resolveCandidatesMedia`，严格保留用户订阅及梯队优先级，同时支持优先级组内分批并发搜索，命中高质量原唱即早停，避免数十个动态源逐个串行阻塞 3~4 秒。
+   - 自动过滤仅支持歌词/专辑的辅助插件，对有声书/本地网盘/DJ 类插件降权，并引入 5 分钟衰减的 `sourceHealthMap` 故障源动态降权与 `quality-fallback` 单次 `2800ms` 超时/致命网络错误短路机制。
+2. **切歌歌词零迟滞 & `undefined === undefined` 串源漏洞根除**：
+   - 修复 `lyric-searcher` 中动态插件缺少 `key`/`id` 导致 `undefined === undefined` 命中全部 45+ 动态插件无超时串行执行的缺陷；跳过 `resolveDirectLyricItem` 的非搜索调用，补齐 `ds.platform` 匹配与 `.lrc` 链接透传，并对动态 `getLyric` 加 `2000ms` 超时熔断。
+   - 优化 `resolveLyricCore` 取词顺序（`musicItem.lrc` 远端直链紧跟 Step 1 拉取、`matchCache` Step 1.8 直接取词），并将网易云、QQ、酷我拆分为三条独立并发取词管线与动态源同池竞速（新增 `isUsableLyricText` 防止短占位词抢跑）；`resolveLyricWithFallback` 跳过阻塞性远程全量同步；双端搜索同步补充 `_source` 与 `_sourceUrl` 路由透传。
+   - 在 `PlaybackSessionManager` 中新增 `markResolving` / `unmarkResolving`（归零后立即按会话或默认音源唤醒等待队列）与 `waitOnlyIfResolving`，切歌即刻响应不再滞后一秒；支持前导纯空 `[00:00.00]` 占位行清理；将 `fetchBestCandidateAtQuality` 同级高分微差宽限动态缩至 `380ms`（大分差保留 `900ms` 保原唱）。
+   - 拆分 `sourceHealthMap` 搜歌延迟与播歌健康度（搜歌不再洗白失败记录，取链全部音质失败按每歌 `1` 次计入轻度软失败、连续 `3` 首沉底，真实出链即刻恢复；`normalizeMediaSourceShared` 主动拦截 HTTP `404`/`410`/`5xx` 死链）。
+
+---
+
+### 🏷️ 2. 歌词音源提示隔离与桌面悬浮歌词避让 (`fix(lyric)`)
+1. **精确播放会话绑定与持久化（`src/core/playback-session.js`）**：
+   - 切歌词不再污染对当前播放音源的判断，接入 `musicfree/storage` 并在有效期内持久化 6 小时活跃会话（`recordActiveSession`），同时移除 `plugin.playbackSession` 冗余导出以免污染插件协议接口。
+   - 新增用户变量开关 `showSourceInLyric`（通过 `parseBooleanFlag` 解析）用于控制是否在歌词首行展示当前播放音源。
+2. **多行 `[00:00.00]` 署名与空行避让（兼容桌面悬浮歌词）**：
+   - 增强 `injectSourceTagToLrc`，扫描开头连续 `time === 0` 行（跳过纯空行并识别中英文署名/标题横幅），将其微调偏移以防桌面悬浮歌词跳过第 0 行音源提示，同时规避 `[00:00.00]` 双语译文时间戳冲突。
+
+---
+
+### 🛡️ 3. 跨端协议容错、缓存持久化与榜单路由修复 (`fix(core)`)
+1. **统一 HTTP/TLS 自动回退与 JSON 解析守卫（`src/utils/http.js`）**：
+   - 新增 `httpGet`、`LEGACY_HTTP_HOSTS`（含网易云、QQ、酷我、酷狗及 `d.musicapp.migu.cn`、`c.musicapp.migu.cn`、`m.music.migu.cn`）、`isTlsOrConnectionError`、`parseLooseJson` 与 `parseBooleanFlag`，统一接入内置源、`comment-resolver`、`sheet-importer`（含酷我/酷狗通道）、`lyric-searcher`（`directFetchKuwoLyric` 使用 `https://` 入参，`searchKuwoLyrics` 先安全解析 JSON）与 `fallback-pure` 酷我榜单。
+2. **秒开记忆与原生存储空间保护（`src/core/cache.js` & `src/core/storage.js`）**：
+   - 秒开记忆接入 `musicfree/storage`，新增 `compactMatchedItem`（受 `2048` 字符上限安全保护保留 `formats`/`qualities`/`extra`/`meta` 等必要取链字段）与 `220` 条持久化上限；修复 Step 0 查找漏判 `reg.plugin.name`、绕过 `tierBlacklist` 以及重复写盘的问题；`cache` / `clearcache` 指令冷启动补全 `await matchCache.ensureReady(100)`。
+   - `storage.js` 增加 `musicfree/storage` 配额溢出检测与精简核心子集降级保存，并在 `status` 看板展示 `getQuotaStatus()` 告警提示；`dynamic-loader` 新增 `registerPluginBatch` 统一批量 JSON 导入诊断日志统计。
+3. **动态榜单隔离、并发日志统计与纯净版去重**：
+   - `resolveTopLists` 对动态源榜单浅拷贝并补充 `_source` 与 `_sourceUrl`，`resolveTopListDetail` 优先按 `_sourceUrl` / `_source` 精准路由，杜绝同名多线路或 `id` 碰撞串榜。
+   - `dynamic-loader` 修复并发同步/更新时 `syncDiagnosticLogs` 互相清零问题（支持 `resetLogs` 与外层统一汇总），并优化指纹匹配 `0ms` 内存快路径与订阅注册顺序保持。
+   - `scripts/build-pure.js` 消除打包产物中重复打包 `./config` 模块的问题。
+
+---
+
 ## [v1.6.2] - 2026-11-25
 
 > 🛠️ **排行榜稳定性与推荐歌单解析修复**：彻底解决 Windows Electron 下官方榜单/歌单 HTTPS TLS 握手断开导致的「获取排行榜失败」及 8s 超时阻塞，并隔离第三方动态插件排行榜异常。
